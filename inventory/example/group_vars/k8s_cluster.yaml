@@ -1,0 +1,21 @@
+kube_version: 1.36.4
+container_manager: containerd
+kube_network_plugin: cilium
+kube_owner: root
+cilium_kube_proxy_replacement: false
+cilium_tunnel_mode: vxlan
+cilium_operator_replicas: 2
+kube_proxy_mode: ipvs
+kube_proxy_strict_arp: true
+loadbalancer_apiserver_localhost: true
+kube_apiserver_bind_address: "::"
+kube_pods_subnet: 10.233.64.0/18
+kube_service_addresses: 10.233.0.0/18
+supplementary_addresses_in_ssl_keys:
+  - 192.0.2.11
+  - 192.0.2.12
+  - 192.0.2.13
+kubelet_rotate_server_certificates: true
+kubelet_csr_approver_enabled: false
+metrics_server_enabled: false
+cert_manager_enabled: false

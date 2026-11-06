@@ -1,0 +1,37 @@
+all:
+  hosts:
+    node1:
+      ansible_host: 192.0.2.11
+      ip: 10.10.0.11
+      access_ip: 10.10.0.11
+      etcd_member_name: etcd1
+    node2:
+      ansible_host: 192.0.2.12
+      ip: 10.10.0.12
+      access_ip: 10.10.0.12
+      etcd_member_name: etcd2
+    node3:
+      ansible_host: 192.0.2.13
+      ip: 10.10.0.13
+      access_ip: 10.10.0.13
+      etcd_member_name: etcd3
+  children:
+    kube_control_plane:
+      hosts:
+        node1: {}
+        node2: {}
+        node3: {}
+    etcd:
+      hosts:
+        node1: {}
+        node2: {}
+        node3: {}
+    kube_node:
+      hosts:
+        node1: {}
+        node2: {}
+        node3: {}
+    k8s_cluster:
+      children:
+        kube_control_plane: {}
+        kube_node: {}

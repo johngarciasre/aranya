@@ -1,0 +1,91 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: clusterdos
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  destination:
+    name: in-cluster
+    namespace: argocd
+  source:
+    repoURL: https://gitlab.com/aranya-tech/public/clusterdOS.git
+    path: metadeployment/
+    targetRevision: v0.4.8
+    helm:
+      valuesObject:
+        clusterdos:
+          clustername: aranya-takehome
+          ref: v0.4.8
+        gitapps:
+          config:
+            internal: false
+            repoURL: https://github.com/johngarciasre/aranya.git
+            targetRevision: REPLACE_WITH_CONFIG_COMMIT_SHA
+            path: charts/config
+          argo:
+            enabled: false
+          cilium:
+            enabled: false
+          certmanager:
+            enabled: true
+            values:
+              featureGates: ""
+              config:
+                enableGatewayAPI: false
+              webhook:
+                replicaCount: 2
+              cainjector:
+                replicaCount: 2
+          metricsserver:
+            enabled: true
+            syncWave: 2
+            ignoreDifferences:
+              - group: apiregistration.k8s.io
+                kind: APIService
+                name: v1beta1.metrics.k8s.io
+                jsonPointers:
+                  - /spec/caBundle
+            values:
+              replicas: 2
+              args:
+                - --kubelet-certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              apiService:
+                insecureSkipTLSVerify: false
+              tls:
+                type: cert-manager
+              podDisruptionBudget:
+                enabled: true
+                minAvailable: 1
+              affinity:
+                podAntiAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    - labelSelector:
+                        matchLabels:
+                          app.kubernetes.io/name: metrics-server
+                      topologyKey: kubernetes.io/hostname
+          nfd:
+            enabled: true
+            values:
+              master:
+                replicaCount: 2
+                affinity:
+                  podAntiAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      - labelSelector:
+                          matchLabels:
+                            role: master
+                            app.kubernetes.io/name: node-feature-discovery
+                        topologyKey: kubernetes.io/hostname
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true

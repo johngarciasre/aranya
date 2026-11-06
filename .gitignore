@@ -1,0 +1,15 @@
+.cache/
+.venv/
+.local/
+__pycache__/
+*.pyc
+inventory/production/
+**/artifacts/
+**/credentials/
+*.kubeconfig
+admin.conf
+*.key
+*.pem
+*.asc
+*.gpg
+.env

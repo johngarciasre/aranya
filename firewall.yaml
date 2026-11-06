@@ -1,0 +1,102 @@
+- name: Protect cluster nodes before Kubespray
+  hosts: k8s_cluster
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Check required firewall inputs
+      ansible.builtin.assert:
+        that:
+          - firewall_admin_sources | length > 0
+          - firewall_private_interface != firewall_public_interface
+          - ansible_env.SSH_CONNECTION.split()[0] in firewall_admin_sources
+        fail_msg: Include the current operator IPv4 address in firewall_admin_sources.
+
+    - name: Verify nftables is installed
+      ansible.builtin.command: /usr/sbin/nft --version
+      changed_when: false
+
+    - name: Check for previous firewall configuration
+      ansible.builtin.stat:
+        path: /etc/aranya-firewall.nft
+      register: firewall_previous
+
+    - name: Preserve previous firewall configuration
+      ansible.builtin.copy:
+        src: /etc/aranya-firewall.nft
+        dest: /etc/aranya-firewall.previous.nft
+        remote_src: true
+        mode: '0600'
+      when: firewall_previous.stat.exists
+
+    - name: Install lockout rollback
+      ansible.builtin.copy:
+        dest: /etc/aranya-firewall-rollback.sh
+        mode: '0700'
+        content: |
+          #!/bin/sh
+          set -eu
+          {% if firewall_previous.stat.exists %}
+          /usr/bin/cp /etc/aranya-firewall.previous.nft /etc/aranya-firewall.nft
+          /usr/sbin/nft --file /etc/aranya-firewall.nft
+          /usr/bin/systemctl enable --now aranya-firewall.service
+          {% else %}
+          /usr/bin/systemctl disable --now aranya-firewall.service
+          {% endif %}
+
+    - name: Render isolated firewall table
+      ansible.builtin.template:
+        src: templates/firewall.nft.j2
+        dest: /etc/aranya-firewall.nft
+        mode: '0600'
+        validate: /usr/sbin/nft --check --file %s
+
+    - name: Install persistent firewall service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/aranya-firewall.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Aranya host firewall
+          Before=network-pre.target
+          Wants=network-pre.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/sbin/nft --file /etc/aranya-firewall.nft
+          ExecReload=/usr/sbin/nft --file /etc/aranya-firewall.nft
+          ExecStop=/usr/sbin/nft delete table inet aranya
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Arm lockout rollback before activation
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - --unit=aranya-firewall-rollback
+          - --on-active=180s
+          - /etc/aranya-firewall-rollback.sh
+      changed_when: true
+
+    - name: Activate firewall and enable persistence
+      ansible.builtin.systemd_service:
+        name: aranya-firewall.service
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Reload rules atomically
+      ansible.builtin.command: /usr/sbin/nft --file /etc/aranya-firewall.nft
+      changed_when: true
+
+    - name: Close the existing SSH connection
+      ansible.builtin.meta: reset_connection
+
+    - name: Verify a new authenticated connection
+      ansible.builtin.wait_for_connection:
+        timeout: 45
+
+    - name: Cancel rollback after reconnecting
+      ansible.builtin.systemd_service:
+        name: aranya-firewall-rollback.timer
+        state: stopped

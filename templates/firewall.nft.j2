@@ -1,0 +1,24 @@
+add table inet aranya
+delete table inet aranya
+table inet aranya {
+  chain input {
+    type filter hook input priority 10; policy drop;
+    iifname "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    ip protocol icmp accept
+    meta l4proto ipv6-icmp accept
+    ip saddr { {{ firewall_admin_sources | join(', ') }} } tcp dport 22 accept
+    iifname "{{ firewall_private_interface }}" ip saddr { {{ groups['k8s_cluster'] | map('extract', hostvars, 'ip') | join(', ') }} } tcp dport { 2379, 2380, 6443, 10250, 4240 } accept
+    iifname "{{ firewall_private_interface }}" ip saddr { {{ groups['k8s_cluster'] | map('extract', hostvars, 'ip') | join(', ') }} } udp dport 8472 accept
+    iifname != "{{ firewall_public_interface }}" ip saddr {{ kube_pods_subnet }} tcp dport { 53, 6443, 10250, 4240 } accept
+    iifname != "{{ firewall_public_interface }}" ip saddr {{ kube_pods_subnet }} udp dport 53 accept
+    tcp dport 30080 accept
+  }
+  chain forward {
+    type filter hook forward priority 10; policy accept;
+    ct state established,related accept
+    iifname "{{ firewall_public_interface }}" ip daddr {{ kube_pods_subnet }} tcp dport 8080 ct original proto-dst 30080 accept
+    iifname "{{ firewall_public_interface }}" drop
+  }
+}

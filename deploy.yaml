@@ -1,0 +1,5 @@
+- name: Apply host firewall
+  ansible.builtin.import_playbook: firewall.yaml
+
+- name: Install Kubernetes with Kubespray
+  ansible.builtin.import_playbook: .cache/kubespray/cluster.yml
