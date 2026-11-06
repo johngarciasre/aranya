@@ -1,0 +1,227 @@
+- name: Validate exported inputs and prepare SSH targets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    ansible_become: false
+  tasks:
+    - name: Require user-supplied environment variables
+      ansible.builtin.assert:
+        that: lookup('ansible.builtin.env', item) | length > 0
+        fail_msg: "Export {{ item }} before running preflight; see runbook step 3."
+        quiet: true
+      loop:
+        - NODE1_PUBLIC_IP
+        - NODE2_PUBLIC_IP
+        - NODE3_PUBLIC_IP
+        - ANSIBLE_USER
+        - SSH_KEY
+        - FIREWALL_ADMIN_SOURCES
+        - FIREWALL_PRIVATE_INTERFACE
+        - FIREWALL_PUBLIC_INTERFACE
+
+    - name: Validate public addresses and connection settings
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", '-c', "{{ input_validation }}"]
+      vars:
+        input_validation: |
+          import ipaddress, json, os, pathlib, re
+          public = [ipaddress.IPv4Address(os.environ[f'NODE{i}_PUBLIC_IP']) for i in range(1, 4)]
+          if len(set(public)) != 3:
+              raise SystemExit('Public node addresses must be unique IPv4 addresses.')
+          user = os.environ['ANSIBLE_USER']
+          key = pathlib.Path(os.environ['SSH_KEY'])
+          if not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_-]*\$?', user):
+              raise SystemExit('Invalid ANSIBLE_USER.')
+          if not key.is_absolute() or not key.is_file() or not os.access(key, os.R_OK):
+              raise SystemExit('SSH_KEY must be an absolute path to a readable file.')
+          if any(x in str(key) for x in (chr(123) * 2, chr(123) + '%', '${')):
+              raise SystemExit('SSH_KEY must not contain template expressions.')
+          sources = [str(ipaddress.IPv4Address(x.strip())) for x in os.environ['FIREWALL_ADMIN_SOURCES'].split(',')]
+          private_interface = os.environ['FIREWALL_PRIVATE_INTERFACE']
+          public_interface = os.environ['FIREWALL_PUBLIC_INTERFACE']
+          if private_interface == public_interface or any(not re.fullmatch(r'[a-zA-Z0-9_.:-]+', x) for x in (private_interface, public_interface)):
+              raise SystemExit('Supply distinct, valid private and public interface names.')
+          pods = ipaddress.IPv4Network(os.environ.get('KUBE_PODS_SUBNET') or '10.233.64.0/18')
+          services = ipaddress.IPv4Network(os.environ.get('KUBE_SERVICE_ADDRESSES') or '10.233.0.0/18')
+          if pods.overlaps(services) or any(x in pods or x in services for x in public):
+              raise SystemExit('Pod/service CIDRs must not overlap each other or node addresses.')
+          print(json.dumps(dict(public=list(map(str, public)), user=user, key=str(key), sources=sources,
+                                private_interface=private_interface, public_interface=public_interface,
+                                pods=str(pods), services=str(services))))
+      register: validated_inputs
+      changed_when: false
+
+    - name: Retain validated inputs for this run
+      ansible.builtin.set_fact:
+        preflight_inputs: "{{ validated_inputs.stdout | from_json }}"
+
+    - name: Add public SSH targets without requiring private addresses
+      ansible.builtin.add_host:
+        name: "node{{ item + 1 }}"
+        groups: preflight_nodes
+        ansible_host: "{{ preflight_inputs.public[item] }}"
+        ansible_user: "{{ preflight_inputs.user }}"
+        ansible_ssh_private_key_file: "{{ preflight_inputs.key }}"
+        ansible_host_key_checking: true
+        ansible_ssh_args: '-o ControlMaster=auto -o ControlPersist=60s -o StrictHostKeyChecking=yes'
+        firewall_admin_sources: "{{ preflight_inputs.sources }}"
+        firewall_private_interface: "{{ preflight_inputs.private_interface }}"
+        firewall_public_interface: "{{ preflight_inputs.public_interface }}"
+      loop: [0, 1, 2]
+
+- name: Discover private addresses and verify node prerequisites
+  hosts: preflight_nodes
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    ansible_become: false
+  tasks:
+    - name: Gather fresh facts as the SSH user
+      ansible.builtin.setup:
+
+    - name: Verify privilege escalation
+      ansible.builtin.ping:
+      vars:
+        ansible_become: true
+
+    - name: Verify node operating system and resources
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.system == 'Linux'
+          - ansible_facts.architecture == 'x86_64'
+          - ansible_facts.kernel is version('5.10', '>=')
+          - ansible_facts.processor_vcpus | int >= 4
+          - ansible_facts.memtotal_mb | int >= 7680
+          - ansible_facts.mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_total') | first | int >= 30000000000
+          - ansible_facts.env.SSH_CONNECTION.split()[0] in firewall_admin_sources
+        fail_msg: Check node resources, operating system and the current SSH source allowlist.
+
+    - name: Check required system commands
+      ansible.builtin.command: "{{ item }} --version"
+      changed_when: false
+      loop:
+        - /usr/sbin/nft
+        - /usr/bin/systemd-run
+
+    - name: Verify time synchronization
+      ansible.builtin.command: timedatectl show --property=NTPSynchronized --value
+      register: time_status
+      changed_when: false
+      failed_when: time_status.rc != 0 or time_status.stdout | trim != 'yes'
+
+    - name: Inspect global IPv4 addresses on the private interface
+      ansible.builtin.command:
+        argv: [ip, -j, '-4', address, show, dev, "{{ firewall_private_interface }}", scope, global]
+      register: private_address
+      changed_when: false
+
+    - name: Collect private interface address candidates
+      ansible.builtin.set_fact:
+        private_candidates: "{{ private_address.stdout | from_json | map(attribute='addr_info') | flatten | map(attribute='local') | list }}"
+
+    - name: Require exactly one address rather than guessing
+      ansible.builtin.assert:
+        that: private_candidates | length == 1
+        fail_msg: The selected private interface must have exactly one global IPv4 address; verify the interface with the provider.
+
+    - name: Require an RFC1918 private address
+      ansible.builtin.assert:
+        that: private_candidates[0] is match('^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+        fail_msg: The selected interface does not have an RFC1918 private IPv4 address.
+
+    - name: Retain discovered private address for peer checks
+      ansible.builtin.set_fact:
+        ip: "{{ private_candidates[0] }}"
+
+    - name: Verify public interface exists
+      ansible.builtin.command:
+        argv: [ip, link, show, dev, "{{ firewall_public_interface }}"]
+      changed_when: false
+
+    - name: Check routes to private peers
+      ansible.builtin.command:
+        argv: [ip, -j, '-4', route, get, "{{ hostvars[item].ip }}"]
+      loop: "{{ groups['preflight_nodes'] | difference([inventory_hostname]) }}"
+      register: peer_routes
+      changed_when: false
+
+    - name: Verify private peer routes
+      ansible.builtin.assert:
+        that:
+          - (item.stdout | from_json | first).dev == firewall_private_interface
+          - (item.stdout | from_json | first).prefsrc | default('') == ip
+      loop: "{{ peer_routes.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check private peer connectivity
+      ansible.builtin.command:
+        argv: [ping, -c, '1', -W, '3', "{{ hostvars[item].ip }}"]
+      loop: "{{ groups['preflight_nodes'] | difference([inventory_hostname]) }}"
+      changed_when: false
+
+    - name: Check HTTPS endpoints and DNS
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        method: HEAD
+        timeout: 15
+        status_code: [200, 301, 302, 307, 308, 401, 403, 404, 405]
+      loop:
+        - https://github.com/
+        - https://gitlab.com/
+        - https://registry.k8s.io/
+        - https://quay.io/
+        - https://registry-1.docker.io/v2/
+        - https://charts.jetstack.io/
+        - https://kubernetes-sigs.github.io/
+
+- name: Save discovered environment values only after all node checks succeed
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    ansible_become: false
+    preflight_output: "{{ playbook_dir }}/../.local/discovered.env"
+  tasks:
+    - name: Verify private addresses and build Bash environment values
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - '-c'
+          - |
+            import ipaddress, json, sys
+            private = [ipaddress.IPv4Address(x) for x in json.loads(sys.argv[1])]
+            inputs = json.loads(sys.argv[2])
+            public = list(map(ipaddress.IPv4Address, inputs['public']))
+            pods, services = map(ipaddress.IPv4Network, (inputs['pods'], inputs['services']))
+            if len(set(private)) != 3 or set(private) & set(public):
+                raise SystemExit('Discovered private addresses must be unique and separate from public addresses.')
+            if any(x in pods or x in services for x in private):
+                raise SystemExit('Discovered private addresses overlap pod/service CIDRs; change those environment values and rerun preflight.')
+            for i, address in enumerate(private, 1):
+                print(f'NODE{i}_PRIVATE_IP={address}')
+          - "{{ [hostvars.node1.ip, hostvars.node2.ip, hostvars.node3.ip] | to_json }}"
+          - "{{ preflight_inputs | to_json }}"
+      register: discovered_environment
+      changed_when: false
+
+    - name: Create private local output directory
+      ansible.builtin.file:
+        path: "{{ preflight_output | dirname }}"
+        state: directory
+        mode: '0700'
+
+    - name: Write discovered addresses without modifying user inputs or production inventory
+      ansible.builtin.copy:
+        dest: "{{ preflight_output }}"
+        mode: '0600'
+        content: |
+          # Generated by preflight; source with set -a to export these values.
+          {{ discovered_environment.stdout }}
+
+    - name: Report the next step
+      ansible.builtin.debug:
+        msg: "Preflight passed. Source {{ preflight_output }} with set -a, then render and validate inventory as described in runbook step 4."

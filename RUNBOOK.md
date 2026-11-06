@@ -1,153 +1,38 @@
 # Aranya: build and operate the cluster
 
-## Status and scope
+Follow the numbered steps in order from a Bash shell on the operator workstation.
+Steps 1–4 prepare local files and verify the servers; step 5 is the first step
+that changes server configuration. Do not configure networking, SSH or firewall
+rules manually while preparing the inputs. Ansible applies those settings.
 
-**The cluster, required addons and nginx are deployed; disruptive failover and
-reviewer handoff remain pending.** On 2026-11-06 UTC three Kubernetes v1.36.4
-nodes were Ready, Cilium was 3/3 and its operator 2/2. Argo CD v3.6.1 workloads
-were Ready: Redis 3/3, server and repo-server 2/2 each, and controller 1/1. All
-six Applications were Synced/Healthy. The metrics APIService was Available with
-TLS verification, `kubectl top` worked, and NFD reported Intel CPU vendor labels
-on all three nodes. Three nginx pods were Ready on separate nodes and public HTTP
-returned `hello aranya` from all three addresses.
+For context, see the [scope](README.md#scope),
+[architecture](README.md#architecture-and-availability),
+[known limits](README.md#known-limits) and [status](README.md#status).
 
-The vendored config chart fixes upstream v0.4.8's unsupported `apiVersion: v3`;
-an explicit cluster name also ensures Argo's Helm 4 passes the value. Host
-firewall protection and the revised rollback playbook are installed; public etcd,
-API and kubelet ports were filtered. The rollback script was not tested by
-inducing an SSH lockout. Failover, reviewer access, GPG encryption, recipient
-decryption and email handoff remain unverified. The private production inventory
-contains node addresses and SSH settings; the public example remains parameterized.
-BGP and kube-vip are disabled; external clients switch node endpoints manually or
-provide their own load balancer.
+## 1. Confirm permission and target servers
 
-This runbook starts with provider-provisioned, fresh Linux servers (the email
-supplies servers, so provisioning VMs is outside its scope). Kubespray installs
-containerd, Kubernetes, stacked etcd and Cilium. Argo CD installs clusterdOS and
-reconciles nginx from the submission repository. No application secrets belong in
-Git. Run commands in Bash on the operator workstation, except where stated.
+1. Obtain approval to build on the three assigned servers.
+2. Confirm they are fresh, disposable nodes with no existing cluster or valuable
+   workloads. Stop if that is not true; do not reset or repurpose them.
+3. Obtain their public SSH addresses, SSH username/key, interface names and
+   independently verified SSH host-key fingerprints from the assignment owner.
+   Do not worry about private IPs; preflight discovers them. Keep inputs private.
 
-## 1. Design and prerequisites
+**Continue only when the target nodes and authorization are confirmed.**
 
-### Topology
+## 2. Set up the workstation
 
-- Three nodes, each in `kube_control_plane`, `etcd` and `kube_node`.
-  Three etcd voters tolerate **one** unavailable node, not two. Workloads are
-  permitted on control-plane nodes because this is a small take-home cluster.
-- SSH uses public `ansible_host`; Kubernetes/etcd/Cilium use private `ip` and
-  `access_ip`. These must be real addresses assigned to the nodes.
-- Cilium uses VXLAN with kube-proxy/IPVS retained; its operator has two replicas.
-- No BGP, kube-vip, Reserved IP or external API load balancer is configured.
-  Host components use their local apiserver. Losing one whole node leaves two
-  apiservers and etcd quorum; external clients manually select a surviving node.
-- Argo CD uses the upstream HA install bundle; clusterdOS manages cert-manager,
-  metrics-server and NFD. Disable its `argo` and `cilium` gitapps to prevent two
-  tools managing those components. The override directs the enabled `config`
-  gitapp to the vendored chart instead of the broken upstream chart.
-- Three nginx pods are spread across nodes, with resource bounds, HTTP probes,
-  restricted pod security and a PDB. A NodePort exposes HTTP at
-  `http://NODE_PUBLIC_IP:30080/` without assuming a cloud load-balancer controller.
+On the Linux workstation, check that Python 3.12 with venv/pip, Git, curl, tar,
+sha256sum, OpenSSH, OpenSSL, GnuPG and `envsubst` are available. Install missing
+prerequisites locally before continuing. On Ubuntu, after reviewing the impact:
+`sudo apt-get install python3-venv python3-pip git curl openssh-client openssl gnupg gettext-base`.
+Install Podman only if using the optional container smoke test below.
 
-### Known limits
+Use the [pinned versions](README.md#versions). Do not use upstream `master`,
+`main`, `stable`, `latest` or unpinned chart upgrades for dependencies during
+reproduction. Verify the nginx digest for your architecture before using ARM nodes.
 
-This is production-oriented, not a claim of complete production readiness.
-The selected availability criterion is surviving nodes retaining API access after
-one whole-node failure. External API and HTTP clients must manually switch node
-addresses or use a separately managed load balancer; a fixed node URL is not an
-HA endpoint. Local apiserver-only failure temporarily blocks that node's host
-clients until kubelet restarts the static pod; there is no host-client fallback to
-another apiserver. Workloads using the Kubernetes Service need live recovery tests.
-No automatic node replacement, off-host etcd backup, public HTTPS, OIDC or alerting
-backend is configured. NFD has replicated masters and labels all three nodes, but
-its failure recovery remains unverified; not every auxiliary chart component is
-replicated. A PDB protects voluntary interruptions, not node crashes. Sharing one
-admin identity gives full control but not per-reviewer audit attribution; delete
-the take-home cluster after evaluation.
-
-### Infrastructure gate: do not skip
-
-Confirm with the provider/assignment owner:
-
-1. Three disposable servers, preferably Ubuntu 24.04 LTS, x86_64, kernel >=5.10,
-   unique names/MACs, Python 3, key-based SSH and sudo. Aim for >=4 vCPU/8 GiB RAM
-   and >=30 GiB disk **per node** to leave room for the Argo HA bundle and addons.
-   Do not run Kubespray over an existing cluster or valuable workloads.
-2. Private connectivity between all nodes. Confirm their private CIDR, interface
-   names and routes using `ip -br address` and `ip route` over SSH. Ensure pod
-   `10.233.64.0/18` and service `10.233.0.0/18` ranges do not overlap the node,
-   VPN, corporate or other routed networks; change them before installation if so.
-3. Agree reviewer access: source-restricted public TCP 6443 on each node, or
-   SSH tunnels to individual private node APIs. No VIP or provider BGP is needed.
-4. DNS, time synchronization and outbound HTTPS for package repositories,
-   GitHub, GitLab, registry.k8s.io, quay.io, Docker Hub and Helm repositories.
-5. Firewall rules below exist at the provider and/or OS layer. Kubespray is not
-   a provider-firewall manager. Keep the firewall; do not blindly disable it.
-6. Operator workstation: Linux, Python 3.12 with venv/pip, Git, curl, tar,
-   sha256sum, OpenSSH, OpenSSL, GnuPG and `envsubst`. Podman is optional for the smoke test.
-   On Ubuntu, install missing prerequisites only after reviewing their impact:
-   `sudo apt-get install python3-venv python3-pip git curl openssh-client openssl gnupg gettext-base`.
-
-### Firewall policy
-
-| Path | Allow | Restriction |
-| --- | --- | --- |
-| Operator/reviewer -> node | TCP 22 | Only authorized operator/reviewer source IPs; SSH key required |
-| Internet -> node | TCP 2026 | Public SSH; authorized key required, password/keyboard-interactive authentication disabled |
-| Internet -> node | TCP 30080 | Only intended public HTTP service |
-| Operator/reviewer -> public API | TCP 6443 | Only authorized source IPs; omit for SSH-only access |
-| Private nodes -> API | TCP 6443 | Cluster node addresses |
-| Private control planes -> etcd | TCP 2379, 2380 | Only cluster nodes, never public |
-| Private nodes/pods -> kubelet | TCP 10250 | Cluster node/pod CIDRs, never public |
-| Private nodes -> nodes | UDP 8472; TCP 4240; ICMP | VXLAN and Cilium health checks |
-| Control planes -> pod CIDR | TCP 10250, 443 | Metrics-server and webhook traffic, via CNI |
-| Cluster workloads -> resolvers | UDP/TCP 53 | Configured DNS resolvers |
-| Nodes -> time source | UDP 123 | Configured NTP source |
-| Nodes/workloads -> upstreams | TCP 443; OS repo ports as needed | Required downloads and GitOps |
-
-Do not open etcd, kubelet, Cilium overlay or Argo UI to the public internet. With
-an external public API LB, allow TCP 6443 only from authorized reviewer sources
-and the LB backend paths. Hubble/Prometheus ports are unnecessary unless enabled.
-See the pinned [Kubespray ports](https://github.com/kubernetes-sigs/kubespray/blob/v2.32.0/docs/operations/port-requirements.md)
-and [Cilium requirements](https://docs.cilium.io/en/v1.20/operations/system_requirements/)
-for additional features. Test the actual network, not just the rule definitions.
-
-The approved host implementation is `firewall.yaml` with `templates/firewall.nft.j2`.
-It owns only the `inet aranya` table, never flushes the ruleset, and leaves outbound
-traffic and private/pod forwarding to Kubernetes/Cilium. Public forwarding permits
-only the selected nginx NodePort-to-pod port 8080 flow. Public API access stays
-closed; use SSH tunnels initially. ICMP/IPv6 neighbor discovery and established
-connections remain allowed. This assumes the current IPv4 cluster and standard
-kube-proxy NAT path; rerun live HTTP and filtering tests after Cilium installation.
-
-The same serial playbook configures SSH on both 22 and 2026, including Ubuntu's
-`ssh.socket` listeners. Port 2026 is deliberately open to all sources; port 22
-retains its source allowlist. It validates SSH configuration before restarting
-listeners, preserves existing authenticated sessions, then verifies fresh SSH
-connections on both ports. Existing authorized keys are unchanged.
-
-## 2. Versions and workstation setup
-
-| Component | Pin |
-| --- | --- |
-| Kubespray | v2.32.0 / `9751ea6f63244e433a7a6263d9ecf381e57bb8e9` |
-| Kubernetes | 1.36.4 (Kubespray release default) |
-| Cilium | 1.20.2 (Kubespray release default) |
-| Ansible / ansible-core | 12.3.0 / 2.19.15 (`requirements.lock`) |
-| Argo CD | v3.6.1 HA bundle |
-| clusterdOS | v0.4.8 / `92a191cdb1ecda83c25d9d218fce3dd3f7b2ba1c` |
-| cert-manager chart | v1.21.1 (clusterdOS defaults) |
-| metrics-server chart | 3.14.0 (clusterdOS defaults) |
-| NFD chart | v0.19.0 (clusterdOS defaults) |
-| Helm (local rendering only) | v3.19.0 |
-| nginx | 1.30.6-alpine; amd64 digest pinned in its Deployment |
-
-Argo 3.6 documents testing against Kubernetes 1.34-1.37. Do not use upstream
-`master`, `main`, `stable`, `latest` or unpinned chart upgrades during reproduction.
-The nginx image digest is amd64-specific; choose and verify the appropriate digest
-before using ARM nodes. `requirements.lock` records all resolved Python dependencies.
-
-Clone the submission's `main` branch at its current head; no commit SHA
-substitution is required. Tag `v0.1.0` identifies the initial release:
+Clone the submission's `main` branch at its current head:
 
 ```bash
 git clone --branch main https://github.com/johngarciasre/aranya.git
@@ -167,9 +52,9 @@ test "$(git -C "$ROOT/.cache/clusterdos" rev-parse HEAD)" = \
   92a191cdb1ecda83c25d9d218fce3dd3f7b2ba1c
 ```
 
-Commands creating directories/clones are for a fresh checkout. On a repeat run,
+Run directory/clone creation commands only on a fresh checkout. On a repeat run,
 reuse and verify existing clones rather than overwriting them. For local rendering
-checks, download Helm into `.cache` (this example workstation is linux/amd64):
+checks on linux/amd64, download and verify Helm:
 
 ```bash
 curl --fail --show-error --location \
@@ -182,188 +67,178 @@ curl --fail --show-error --location \
 tar -xzf "$ROOT/.cache/helm-v3.19.0-linux-amd64.tar.gz" -C "$ROOT/.cache"
 "$ROOT/.cache/linux-amd64/helm" version --short
 "$ROOT/.venv/bin/python" "$ROOT/tests/check.py"
+"$ROOT/.venv/bin/python" "$ROOT/tests/check_inventory_template.py"
+"$ROOT/.venv/bin/python" "$ROOT/tests/check_preflight.py"
+"$ROOT/.venv/bin/python" "$ROOT/tests/check_firewall.py"
+"$ROOT/.venv/bin/python" -m pip check
 # Optional: pulls nginx and runs/removes only a test container on this workstation.
 "$ROOT/.venv/bin/python" "$ROOT/tests/check.py" --container
 ```
 
-The checks parse inventory, syntax-check upstream `cluster.yml`, render the parent
-and requested child charts, and assert nginx settings. For `charts/config`, they
-check the unchanged upstream values, template and license byte-for-byte, verify
-`apiVersion: v2`, run Helm lint/render and require rendering without a cluster name
-to fail. They never contact cluster nodes. Upstream syntax checking may warn about
-unused `bastion`, `calico_rr` and `_kubespray_needs_etcd` groups. These are not
-deployment validation.
+Compare the results with [validation coverage](README.md#validation-coverage).
+Do not treat local syntax/rendering checks as proof of deployment.
+
+**Continue only when dependency verification and the local checks pass.**
 
 ## 3. Supply environment-specific inventory inputs
 
-The checked-in inventory is an example only. Supply **11 required values** in a
-private Bash environment file: six node IPs (three public SSH IPs and three private
-cluster IPs), Ansible SSH username and key path, a comma-separated list of
-operator IPv4 addresses for the firewall, and the private/public interface names.
-Two subnet inputs have defaults but must be changed if they overlap your network.
-The template derives each `access_ip` from its private IP, the API SAN list from
-the three public IPs, and firewall YAML from the comma-separated source list. The
-sample contains documentation-only addresses and is not ready to deploy.
+Provide **8 required values** as exported environment variables or in a private
+Bash file. Do not worry about private IPs: preflight discovers them in step 4.
+The steps below use a file. Review [inventory rendering](README.md#inventory-rendering)
+for validation rules.
 
-Create the private inputs file, review the sample, and replace its example values
-with those for your environment (the subnet defaults can be kept if suitable):
+If production inventory already exists, stop before rendering. Preserve any
+needed artifacts before deliberately replacing generated inventory; never delete
+or overwrite it just to get past the renderer's check.
 
-```bash
-test ! -e "$ROOT/.local/production.env" && cp "$ROOT/inventory/production.env.example" "$ROOT/.local/production.env"
-chmod 600 "$ROOT/.local/production.env"
-# Edit .local/production.env with your assigned node and operator values.
-```
+1. Copy the sample only if a private input file does not already exist:
 
-The input file is sourced as Bash; use only a file you created and trust. Its
-`SSH_KEY` value must be an absolute path and may use `$HOME`, as shown in the
-sample. Install `envsubst` if it is missing (`sudo apt-get install gettext-base`).
-Then render the private production inventory from the file:
+   ```bash
+   test ! -e "$ROOT/.local/production.env" && cp "$ROOT/inventory/production.env.example" "$ROOT/.local/production.env"
+   chmod 600 "$ROOT/.local/production.env"
+   ```
 
-```bash
-set -a
-source "$ROOT/.local/production.env"
-set +a
-bash "$ROOT/scripts/render_inventory.sh"
-export INVENTORY="$ROOT/inventory/production/hosts.yaml"
-```
+2. Edit `.local/production.env`. Replace every sample address and fill in these
+   values from the assigned servers; this changes a local file, not the nodes:
 
-Alternatively export all 11 variables directly in the shell and run the renderer;
-no file is required. To have the renderer source a trusted file itself, pass its
-path as the first argument.
+   | Variable(s) | Required input |
+   | --- | --- |
+   | `NODE1_PUBLIC_IP`, `NODE2_PUBLIC_IP`, `NODE3_PUBLIC_IP` | Public SSH addresses and API certificate SANs |
+   | `ANSIBLE_USER`, `SSH_KEY` | SSH login and readable private key path |
+   | `FIREWALL_ADMIN_SOURCES` | Comma-separated authorized operator IPv4 addresses; include the current connection source |
+   | `FIREWALL_PRIVATE_INTERFACE`, `FIREWALL_PUBLIC_INTERFACE` | Actual private and public node interface names |
 
-The renderer refuses to overwrite an existing production inventory, checks that
-all 11 required values are present, validates IPv4 addresses, unique node
-addresses, RFC1918 private IPs, firewall source addresses, distinct interfaces,
-and pod/service subnet overlap, then renders and YAML-parses the files. It cannot
-check overlap with networks you do not provide. Output is git-ignored and
-mode-restricted.
+   Set `SSH_KEY` to an absolute path (use `$HOME` if needed). Verify the optional
+   pod/service CIDRs, defaulting to `10.233.64.0/18` and `10.233.0.0/18`, do not
+   overlap node, VPN, corporate or routed networks. Change only the corresponding
+   environment values if necessary. Leave the other checked-in deployment
+   settings unchanged; see [architecture](README.md#architecture-and-availability)
+   and the [config workaround](README.md#clusterdos-config-workaround) for context.
 
-The current workstation already has an existing production inventory. To change
-inputs, first move or remove only the generated `inventory/production` directory
-after verifying it contains no needed artifacts; the renderer will not overwrite
-it. Review the result privately before provisioning. Use the example files for
-non-sensitive Kubespray syntax and local checks, not as real deployment data.
+3. Export the inputs from the Bash file you created and trust:
 
-These are the 11 environment inputs:
+   ```bash
+   set -a
+   source "$ROOT/.local/production.env"
+   set +a
+   ```
 
-| Variable(s) | Meaning |
-| --- | --- |
-| `NODE1_PUBLIC_IP`, `NODE2_PUBLIC_IP`, `NODE3_PUBLIC_IP` | Public SSH addresses; also used as API certificate SANs and public HTTP endpoints |
-| `NODE1_PRIVATE_IP`, `NODE2_PRIVATE_IP`, `NODE3_PRIVATE_IP` | Private cluster addresses; also used as `access_ip` |
-| `ANSIBLE_USER`, `SSH_KEY` | SSH login and private key path |
-| `FIREWALL_ADMIN_SOURCES` | Comma-separated authorized operator IPv4 addresses; include the current connection source |
-| `FIREWALL_PRIVATE_INTERFACE`, `FIREWALL_PUBLIC_INTERFACE` | Actual private and public node interface names |
+   Alternatively, export all eight values directly; no input file is required.
+   Do not set `NODE1_PRIVATE_IP`, `NODE2_PRIVATE_IP` or `NODE3_PRIVATE_IP`.
 
-The optional `KUBE_PODS_SUBNET` and `KUBE_SERVICE_ADDRESSES` inputs default to
-`10.233.64.0/18` and `10.233.0.0/18`. Verify neither overlaps node, VPN,
-corporate or other routed networks; set different CIDRs before rendering if they
-do. The renderer checks the supplied node addresses and CIDRs, not external routes.
-`install.yaml` sets `aranya-takehome`; choose a unique name only if needed, and
-update both `clusterdos.clustername` and `gitapps.config.values.clustername`.
+**Continue only when the inputs are exported.**
 
-Do not confuse Kubespray `cluster_name` (which also influences the DNS domain) with
-the clusterdOS display name. Leave Kubespray DNS defaults unless intentionally
-changing the metrics-server chart's `tls.clusterDomain` too.
+## 4. Verify access and deployment prerequisites
 
-No shared VIP/LB is needed for the selected whole-node failure criterion. All
-three nodes are control planes: Kubespray's default nginx localhost proxies for
-non-control-plane nodes are not installed here. Host clients use their local API;
-the generated external admin config initially selects one node. It does not
-switch automatically, so use the endpoint-switching instructions below.
+1. Authenticate SSH host-key fingerprints with the assignment owner and add only
+   verified keys to your workstation's `known_hosts`. Do not rely on `ssh-keyscan`
+   alone. If using a separate verified file, export `ANSIBLE_SSH_COMMON_ARGS` with
+   its `UserKnownHostsFile` option; do not disable host-key checking.
+2. Keep the eight inputs from step 3 exported and run the Ansible preflight:
 
-Keep `loadbalancer_apiserver_localhost: true` and
-`kube_apiserver_bind_address: "::"` despite having no proxy pods on these control
-planes. Kubespray uses these settings to point Cilium and kube-proxy at node-local
-APIs. Setting localhost loadbalancing to false would instead pin some clients to
-the first control plane. `kubeconfig_localhost_ansible_host: true` makes the exported
-admin config select the first node's public SSH address, covered by the SAN list.
+   ```bash
+   "$ROOT/.venv/bin/ansible-playbook" -i localhost, "$ROOT/scripts/preflight.yaml"
+   ```
 
-Verify SSH host-key fingerprints with the assignment owner or provider console,
-then add only those verified keys to your workstation's `known_hosts`. `ssh-keyscan`
-alone does not authenticate a host. Kubespray's stock config disables host-key
-checking; explicitly override it and its `/dev/null` known-hosts setting:
+   Alternatively, run `bash "$ROOT/scripts/preflight.sh"` for the same playbook.
+   Do not use check mode, task skipping or a partial node limit for preflight.
+   For password-based sudo, add `--ask-become-pass` in an interactive terminal;
+   never put the password in inventory, shell history or Git. Stop on failure;
+   do not source a discovery file left over from an earlier run.
+3. After preflight succeeds on all three nodes, export the discovered addresses,
+   then render and validate the production inventory:
+
+   ```bash
+   set -a
+   source "$ROOT/.local/discovered.env"
+   set +a
+   bash "$ROOT/scripts/render_inventory.sh"
+   export INVENTORY="$ROOT/inventory/production/hosts.yaml"
+   "$ROOT/.venv/bin/python" "$ROOT/tests/check_private_inventory.py" "$INVENTORY"
+   "$ROOT/.venv/bin/python" "$ROOT/tests/check_firewall.py" "$INVENTORY"
+   ```
+
+   In a new shell, re-export the step 3 inputs, source `discovered.env` with
+   `set -a`, then export `INVENTORY` as above. If the private interface has
+   multiple global IPv4 addresses, stop and resolve the ambiguity with the
+   provider rather than selecting an address yourself. See
+   [preflight coverage](README.md#validation-coverage) for checks and limits.
+
+Before continuing, manually confirm package-repository access, no overlap with
+VPN/corporate/other routed networks and provider firewall support for the required
+private TCP/UDP paths. Pings and HTTPS probes do not prove those conditions. Have
+the provider resolve blocking policy; do not modify nodes to fit sample inputs.
+
+**Stop on any failed check.** Proceed to step 5 only when the automated and manual
+checks are complete. Do not disable firewalls, open 6443 globally or bypass
+host-key checks. See [firewall and SSH design](README.md#firewall-and-ssh-design)
+for rollback behavior.
+
+## 5. Apply the firewall and provision Kubernetes
+
+**This changes all selected servers**, installing packages, replacing networking,
+configuring Kubernetes/etcd and disabling swap. Obtain authorization and verify
+the inventory before running. Do not treat syntax-checking or Kubespray `--check`
+as a deployment test or a safe dry-run of infrastructure changes.
+
+Export the deployment connection settings for this shell. Keep any verified
+`UserKnownHostsFile` option in `ANSIBLE_SSH_COMMON_ARGS`:
 
 ```bash
 export ANSIBLE_CONFIG="$ROOT/.cache/kubespray/ansible.cfg"
 export ANSIBLE_HOST_KEY_CHECKING=True
 export ANSIBLE_SSH_ARGS='-o ControlMaster=auto -o ControlPersist=60s -o StrictHostKeyChecking=yes'
 export ANSIBLE_CACHE_PLUGIN_CONNECTION="$ROOT/.local/facts"
-mkdir -p "$ANSIBLE_CACHE_PLUGIN_CONNECTION"
-"$ROOT/.venv/bin/ansible-inventory" -i "$INVENTORY" --graph
-# Inspect privately; --list contains infrastructure details and potentially future secrets.
-"$ROOT/.venv/bin/ansible-inventory" -i "$INVENTORY" --list
-(cd "$ROOT/.cache/kubespray" && "$ROOT/.venv/bin/ansible" \
-  -i "$INVENTORY" all --private-key "$SSH_KEY" --become -m ping)
 ```
 
-If sudo requires a password, add `--ask-become-pass` to Ansible commands in an
-interactive terminal. Never store it in inventory, shell history or Git. Confirm
-private interfaces, routes, node OS and resources over SSH before proceeding.
-If verified keys are stored separately, add a `UserKnownHostsFile` option to
-`ANSIBLE_SSH_ARGS` including both that file and the workstation's `known_hosts`.
-
-Validate the real inventory before provisioning:
-
-```bash
-"$ROOT/.venv/bin/python" "$ROOT/tests/check_private_inventory.py" "$INVENTORY"
-"$ROOT/.venv/bin/python" "$ROOT/tests/check_firewall.py" "$INVENTORY"
-```
-
-The deployment entry point in section 4 imports `firewall.yaml` first, then the
-pinned Kubespray playbook. `nft` and `systemd-run` must already be installed. The
-firewall play validates a candidate rules file and operates one host at a time.
-Before replacing the active configuration, it installs
-`/etc/aranya-firewall-rollback.sh` and arms a 180-second timer. On a rerun it first
-saves `/etc/aranya-firewall.nft` as `/etc/aranya-firewall.previous.nft`; if
-reconnection is not verified, the script
-restores that configuration, reloads its rules and enables its persistent service.
-On first installation, the script disables the Aranya firewall service instead to
-recover SSH. The play closes the existing SSH connection, verifies a new one and
-only then cancels the timer. A firewall failure stops deployment. A rerun atomically
-replaces only its own table; review existing firewall policy before using it on
-non-fresh nodes. The revised playbook was applied successfully to all three nodes;
-its rollback path was syntax-checked but not exercised by inducing a lockout.
-
-Optionally, with approval on fresh nodes, apply the firewall separately and test
-ports before the combined deployment. The combined deployment will apply it again.
-
-```bash
-"$ROOT/.venv/bin/ansible-playbook" -i "$INVENTORY" "$ROOT/firewall.yaml" --become
-# Preinstall only: briefly binds service-port listeners, then closes them.
-"$ROOT/.venv/bin/python" "$ROOT/tests/check_live_firewall.py" "$INVENTORY" --preinstall
-```
-
-Do not run the listener test after Kubernetes installation; its ports will be in
-use. If the operator IP changes, update the allowlist through an authorized source
-or the provider console. Reviewer SSH/public API grants require separate approval;
-do not open 6443 globally to work around connectivity.
-
-## 4. Provision the fresh nodes
-
-**This changes all selected servers**, installing packages, replacing networking,
-configuring Kubernetes/etcd and disabling swap as required. Obtain authorization
-and verify the inventory before running. Syntax-checking is not a safe dry-run of
-the eventual infrastructure changes; Kubespray `--check` is not a deployment test.
-
-Run from the Kubespray checkout with its Ansible configuration so its relative
-role and library paths resolve. The wrapper imports the local firewall playbook
-first and then the unmodified pinned Kubespray playbook.
+First syntax-check the wrapper from the Kubespray checkout:
 
 ```bash
 (cd "$ROOT/.cache/kubespray" && "$ROOT/.venv/bin/ansible-playbook" \
   -i "$INVENTORY" "$ROOT/deploy.yaml" --syntax-check)
+```
+
+Only after the syntax check succeeds, run the deployment. The wrapper applies
+the firewall first, then provisions Kubernetes:
+
+```bash
 (cd "$ROOT/.cache/kubespray" && "$ROOT/.venv/bin/ansible-playbook" \
   -i "$INVENTORY" "$ROOT/deploy.yaml" --private-key "$SSH_KEY" --become)
 ```
 
-Do not use `--skip-tags`, `--start-at-task` or a partial `--limit` to bypass the
-firewall on hosts being provisioned. Require a successful recap for all three nodes.
-If a run fails, diagnose the first failure, correct its cause and rerun the same
-pinned playbook; do not erase etcd
-or bypass checks as a shortcut. Keep logs private and redact credentials.
+### Default firewall rules applied by Ansible
 
-Kubespray writes `inventory/production/artifacts/admin.conf` and a matching kubectl
-binary. Both are ignored by Git. Use that kubectl rather than an unrelated client:
+**These are the default rules that the command above will set. Do not add them
+manually.** Ansible derives source addresses and interface names from the rendered
+inventory. Use this table to verify the result, not as a separate setup procedure.
+
+| Path | Allow | Exposure | Default restriction |
+| --- | --- | --- | --- |
+| Operator -> node SSH | TCP 22 | Restricted | Sources in `FIREWALL_ADMIN_SOURCES`; authorized SSH key required |
+| Internet -> node SSH | TCP 2026 | Public | Authorized key required; password/keyboard-interactive authentication disabled |
+| Internet -> nginx | TCP 30080 | Public | NodePort forwarding only to pod TCP 8080 |
+| Private nodes -> API | TCP 6443 | Private | Inventory node IPs on the private interface; public API access blocked |
+| Private nodes -> etcd | TCP 2379, 2380 | Private | Inventory node IPs on the private interface |
+| Private nodes -> kubelet/Cilium health | TCP 10250, 4240 | Private | Inventory node IPs on the private interface |
+| Private nodes -> Cilium overlay | UDP 8472 | Private | Inventory node IPs on the private interface |
+| Pods -> node DNS/API/kubelet/Cilium health | TCP 53, 6443, 10250, 4240; UDP 53 | Private | Pod CIDR arriving on a non-public interface |
+| Node-local traffic | All | Private | Loopback interface |
+| ICMP/IPv6 neighbor discovery | ICMP, IPv6 ICMP | Public | Allowed for network diagnostics and discovery |
+| Replies to existing connections | Established/related traffic | Restricted | Allowed by connection tracking |
+
+Verify public TCP 6443, etcd and kubelet remain blocked. Do not add reviewer API
+or SSH grants without separate approval. Other unsolicited host input and public
+forwarding are dropped; outbound traffic and private/pod forwarding remain
+allowed. Review [firewall and SSH design](README.md#firewall-and-ssh-design) for
+implementation details. Use the live checks in step 9 to verify filtering and
+public HTTP after installation.
+
+Do not use `--skip-tags`, `--start-at-task` or a partial `--limit` to bypass the
+firewall. Require a successful recap for all three nodes. On failure, diagnose
+the first failed task, correct its cause and rerun the same pinned playbook.
+Do not erase etcd or bypass checks. Keep logs private and redact credentials.
+
+Use the generated admin config and matching kubectl; restrict their permissions:
 
 ```bash
 export KUBECONFIG="$ROOT/inventory/production/artifacts/admin.conf"
@@ -374,9 +249,7 @@ chmod 700 "$KUBECTL"
 
 ### Workstation API connectivity and manual switching
 
-Keep the generated config private and create an operator copy. All three public
-API addresses are in the certificate SAN list. These initial steps are required
-for both direct and SSH-only access:
+Create a private operator copy for either direct or SSH-only access:
 
 ```bash
 cp "$KUBECONFIG" "$ROOT/.local/operator.kubeconfig"
@@ -396,8 +269,8 @@ If that node is unavailable, set `NODE_PUBLIC_IP` to node2 or node3 and rerun
 `config set-cluster` and `/readyz`. Test all three addresses while healthy. Do not
 use `insecure-skip-tls-verify` or assume kubeconfig tries alternate endpoints.
 
-For SSH-only access instead, keep public TCP 6443 closed and select a node-local
-tunnel, using the values from `.local/production.env`:
+For SSH-only access, keep public TCP 6443 closed and use the exported inventory
+inputs to select a node-local tunnel:
 
 ```bash
 "$KUBECTL" config set-cluster "$API_CLUSTER" --server=https://127.0.0.1:16443
@@ -407,14 +280,12 @@ ssh -p 2026 -i "$SSH_KEY" \
   -N -L 127.0.0.1:16443:127.0.0.1:6443 "$ANSIBLE_USER@$NODE1_PUBLIC_IP"
 ```
 
-`HostKeyAlias` reuses the independently verified host key stored under the node's
-IP rather than prompting to trust a new `[IP]:2026` identity. Port 22 also works
-from an allowlisted source. No new keys or reviewer accounts are provisioned by
-opening 2026.
-
-Keep the tunnel running in a separate terminal; restart it through node2/node3 if
-needed. Certificates include `127.0.0.1`. Reviewers need their own authorized SSH
-access for this option: the admin kubeconfig does not grant SSH access.
+Use only independently verified host keys. Keep the tunnel running in a separate
+terminal; restart it through node2/node3 if needed. Use port 22 only from an
+allowlisted source. Provision and verify authorized SSH access for each reviewer
+before handing off a tunnel-based config. See
+[firewall and SSH design](README.md#firewall-and-ssh-design) for listener and
+host-key alias details.
 
 ```bash
 "$KUBECTL" get --raw='/readyz?verbose'
@@ -428,13 +299,13 @@ access for this option: the admin kubeconfig does not grant SSH access.
 
 Require three Ready nodes with private InternalIPs, no blocking control-plane
 `NoSchedule` taints, Cilium ready on every node and two available operator replicas.
-If expected taints remain, investigate Kubespray's result before removing them.
+Investigate unexpected taints before removing them.
 
-## 5. Validate and approve kubelet serving certificates
+## 6. Validate and approve kubelet serving certificates
 
-Inventory sets `kubelet_rotate_server_certificates: true`, so kubelets request
-CA-signed serving certificates. The automatic CSR approver is explicitly disabled:
-unknown provider addressing/DNS is not a safe basis for automatic approval.
+Inspect each kubelet serving CSR separately. See
+[architecture](README.md#architecture-and-availability) for the certificate
+approval policy; do not enable blanket automatic approval.
 
 ```bash
 "$KUBECTL" get csr -o wide
@@ -447,12 +318,12 @@ export CSR=REPLACE_WITH_ONE_KUBELET_SERVING_CSR
 Before approving **each** request, confirm:
 - signer `kubernetes.io/kubelet-serving`, requester `system:node:NODE_NAME`;
 - subject `CN=system:node:NODE_NAME`, organization `system:nodes`;
-- DNS/IP SANs match only that verified node (in particular its private InternalIP);
+- DNS/IP SANs match only that verified node, including its private InternalIP;
 - usages are server authentication and required signing/key encipherment, not an
   unrelated identity. Compare against `kubectl get node NODE_NAME -o yaml` and
   the provider's authoritative inventory.
 
-After this validation only:
+Only after validation:
 
 ```bash
 "$KUBECTL" certificate approve "$CSR"
@@ -460,18 +331,18 @@ After this validation only:
   | base64 --decode | openssl x509 -noout -subject -issuer -dates
 ```
 
-Repeat for all three serving CSRs. Do not bulk-approve all pending requests. For
+Repeat for all three serving CSRs. Do not bulk-approve pending requests. For
 longer-lived operation, monitor renewal requests and repeat verification before
-expiry, or configure a separately reviewed restricted approver policy. Client
-certificate rotation is distinct and remains enabled by Kubespray.
+expiry, or configure a separately reviewed restricted approver policy.
 
-## 6. Install Argo CD and clusterdOS
+## 7. Install Argo CD and clusterdOS
 
-Use server-side apply for the large Argo CRDs. Initial installation is into a fresh
-namespace; this does not authorize overwriting an existing Argo installation.
-The current cluster already has Argo CD and clusterdOS installed. For a fresh
-install, confirm that the pinned config chart commit is accessible before applying
-`install.yaml`; for a fork, publish and pin its chart as described in section 7.
+Use server-side apply for the large Argo CRDs. Install into a fresh namespace;
+do not overwrite an existing Argo installation without authorization. Confirm
+the pinned config chart commit is accessible before applying `install.yaml`.
+For a fork, publish and pin its chart using [section 8](#8-publish-code-and-deploy-nginx).
+See the [config workaround](README.md#clusterdos-config-workaround) for provenance
+and the override's purpose.
 
 ```bash
 "$KUBECTL" create namespace argocd --dry-run=client -o yaml | "$KUBECTL" apply -f -
@@ -487,23 +358,11 @@ install, confirm that the pinned config chart commit is accessible before applyi
 "$KUBECTL" apply --server-side -f "$ROOT/install.yaml"
 ```
 
-Argo's HA Redis pods need three schedulable nodes; inspect Pending pods/events
-instead of reducing redundancy silently. clusterdOS creates child Applications:
-`clusterdos-config`, `clusterdos-certmanager`, `clusterdos-metricsserver`,
-`clusterdos-nfd`. All must become Synced/Healthy; inspect their status and logs
-if not. The upstream config chart uses `apiVersion: v3`, which Helm does not
-support, so it must use the vendored correction described below.
-
-`charts/config` vendors the v0.4.8 config chart at upstream commit
-`92a191cdb1ecda83c25d9d218fce3dd3f7b2ba1c`; its only chart change is
-`Chart.yaml`'s `apiVersion: v3` to `v2`. The upstream values and template are
-unchanged; the directory also contains the upstream GPLv3 license and provenance
-README. `install.yaml` redirects only `gitapps.config` with `internal: false` to
-`https://github.com/johngarciasre/aranya.git`, path `charts/config`, at a pinned
-commit. It explicitly sets `gitapps.config.values.clustername` to the parent
-cluster name: Helm 4 omits the default null map, bypassing upstream's injection.
-Keep both names equal. Remove the override only after verifying a later upstream
-release fixes and renders the chart.
+Check Pending pods/events rather than silently reducing Redis redundancy. Require
+`clusterdos-config`, `clusterdos-certmanager`, `clusterdos-metricsserver` and
+`clusterdos-nfd` to become Synced/Healthy; inspect status and logs on failure.
+Keep both cluster-name values equal. Remove the config override only after
+verifying a later upstream release fixes and renders the chart.
 
 ```bash
 "$KUBECTL" -n argocd get applications
@@ -512,16 +371,9 @@ release fixes and renders the chart.
 "$KUBECTL" wait --for=condition=Established --timeout=180s crd/certificates.cert-manager.io
 ```
 
-metrics-server's chart renders cert-manager Issuer/Certificate resources, uses
-CA injection for its aggregated APIService, and trusts the Kubernetes CA when
-scraping kubelets. Neither connection disables TLS verification. Argo ignores the
-injected APIService CA bundle so it does not continually overwrite cainjector's
-work. Its later child sync wave is useful ordering metadata, but do **not** assume
-parent waves wait for child Application health: if cert-manager CRDs are not yet
-installed, inspect the metrics-server Application and retry its sync once the
-prerequisites are Ready. An automated failed sync at the same revision is not
-necessarily retried. After the cert-manager controller/webhook are Ready, use
-Argo's UI to sync `clusterdos-metricsserver`, or request that sync explicitly:
+Do not assume parent sync waves wait for child Application health. If cert-manager
+CRDs are missing, inspect the metrics-server Application and retry its sync once
+the cert-manager controller/webhook are Ready. Use Argo's UI or request the sync:
 
 ```bash
 "$KUBECTL" -n argocd patch application clusterdos-metricsserver --type=merge \
@@ -536,38 +388,39 @@ Argo's UI to sync `clusterdos-metricsserver`, or request that sync explicitly:
 "$KUBECTL" get nodes -L feature.node.kubernetes.io/cpu-model.vendor_id
 ```
 
-Require an APIService CA bundle, verification not disabled, working `kubectl top`
-and NFD feature labels on each node. NFD worker pods inspect host hardware by
-design. On failures inspect Application conditions, pod logs and events; certificate
-or network errors are not a reason to add `--kubelet-insecure-tls`.
+Require an APIService CA bundle, TLS verification enabled, working `kubectl top`
+and NFD feature labels on each node. On failure inspect Application conditions,
+pod logs and events; do not add `--kubelet-insecure-tls` to mask certificate or
+network errors. See [architecture](README.md#architecture-and-availability) for
+the metrics TLS and CA-injection configuration.
 
-For Argo UI access, keep a local-only port-forward:
+For Argo UI access, use a local-only port-forward:
 `"$KUBECTL" -n argocd port-forward svc/argocd-server 8443:443`.
 Read the initial password privately, change it on login and remove the initial
 password Secret after confirming the change. Do not publish the UI/password.
 
-## 7. Publish code and deploy nginx
+## 8. Publish code and deploy nginx
 
-Before publication, inspect `.gitignore`, scan files for secrets and review the
-exact file list. Do not add `.local`, `.cache`, `.venv`, `inventory/production`,
-SSH/GPG keys, plaintext/encrypted kubeconfigs or credential attachments. The
-public `inventory/example` is intentionally non-secret. You may publish sanitized
-real inventory/network values only if authorized; never embed SSH passwords.
+Inspect `.gitignore`, scan files for secrets and review the exact file list before
+publication. Do not add `.local`, `.cache`, `.venv`, `inventory/production`,
+SSH/GPG keys, plaintext/encrypted kubeconfigs or credential attachments. Publish
+sanitized real inventory/network values only with authorization; never embed SSH
+passwords. See [publication](README.md#publication) for repository and release
+status, and content-pinning context.
 
-The public repository is `https://github.com/johngarciasre/aranya`. The submission
-is published on `main` and tagged `v0.1.0`; `takehome` is retained. The config chart
-and nginx sources are pinned to published commit
-`153915629b15f772ea88ada63556c148768d22d0`. The commands below illustrate
-initial publication for a separate fresh checkout only; do not reinitialize this
-repository. Review and authorize subsequent publication separately.
+Run the following initial-publication example only in a separate fresh checkout.
+Do not reinitialize an existing repository. Obtain authorization for the target
+repository and branch before committing or pushing:
 
 ```bash
 git init -b takehome
 git add .gitignore README.md RUNBOOK.md requirements.lock install.yaml deploy.yaml \
-  inventory/example inventory/production.env.example inventory/templates scripts/render_inventory.sh \
+  inventory/example inventory/production.env.example inventory/templates \
+  scripts/render_inventory.sh scripts/preflight.sh scripts/preflight.yaml \
   charts/config argocd/nginx.yaml manifests/nginx/resources.yaml \
   firewall.yaml templates tests/check.py tests/check_private_inventory.py \
-  tests/check_inventory_template.py tests/check_firewall.py tests/check_live_firewall.py tests/check_acceptance.py
+  tests/check_inventory_template.py tests/check_preflight.py tests/check_firewall.py \
+  tests/check_live_firewall.py tests/check_acceptance.py
 git diff --cached --check
 git diff --cached
 # Check the entire staged diff for keys, tokens and confidential data before committing.
@@ -578,16 +431,13 @@ git push -u origin takehome
 git rev-parse HEAD
 ```
 
-The current `install.yaml` and `argocd/nginx.yaml` already pin the published
-content commit shown above. For a fork or new revision, first publish a commit
-containing `charts/config` and `manifests/nginx`, then update each Application's
-repository URL and full content SHA. Review, commit and push those pointer changes
-before applying either Application. A pointer commit references the preceding
-published content commit rather than itself. Future chart or nginx changes similarly
-require a content commit and a pointer update; fixed SHAs do not follow the branch.
+For a fork or new chart/nginx revision:
+1. Publish a content commit containing `charts/config` and `manifests/nginx`.
+2. Update each Application's repository URL and full content SHA.
+3. Review, commit and push the pointer changes before applying either Application.
 
-Apply the pinned config override and verify that the formerly failing Application
-becomes Synced/Healthy:
+Apply the pinned config override and require the child Application to become
+Synced/Healthy:
 
 ```bash
 "$KUBECTL" apply --server-side --dry-run=server -f "$ROOT/install.yaml"
@@ -596,12 +446,9 @@ becomes Synced/Healthy:
 "$KUBECTL" -n argocd describe application clusterdos-config
 ```
 
-Inspect Application conditions and repo-server logs if it does not reconcile;
-do not claim the upstream error is resolved until the child is Synced/Healthy.
-
-Deploy nginx next. Create the namespace first: a server dry-run of a multi-document
-manifest does not persist its Namespace for the subsequent objects. Argo will
-adopt/manage it.
+Inspect Application conditions and repo-server logs on failure. Create the nginx
+namespace before server dry-runs: a multi-document dry-run does not persist its
+Namespace for subsequent objects.
 
 ```bash
 "$KUBECTL" create namespace hello-aranya --dry-run=client -o yaml | "$KUBECTL" apply -f -
@@ -618,25 +465,26 @@ done
 ```
 
 Run curl from outside the provider's private network. Require HTTP 200 and
-`hello aranya` from each intended reachable public address, three Ready pods on
-separate nodes, and an Argo Application that is Synced/Healthy. Verify provider
-NAT/rules if the public IP is not directly assigned to an interface. Port 30080 is
-intentional; if reviewers require port 80, provision provider forwarding/LB from
-80 to 30080 and include its exact settings/URL in the final runbook.
+`hello aranya` from each intended public address, three Ready pods on separate
+nodes, and a Synced/Healthy Application. Verify provider NAT/rules if the public
+IP is not directly assigned to an interface. If reviewers require port 80,
+provision approved provider forwarding/LB from 80 to 30080 and record its exact
+settings/URL in the handoff.
 
-ConfigMap file mounts use `subPath`; after changing its HTML or nginx.conf via
-Git, also change the Deployment pod-template annotation in the same manifest
-commit (e.g. `content-revision`) so a new rollout reloads the mounted files.
+After changing ConfigMap-mounted HTML or nginx.conf via Git, also change the
+Deployment pod-template annotation (e.g. `content-revision`) in the same content
+commit so a new rollout reloads the `subPath` mounts.
 
-## 8. HA acceptance and evidence
+## 9. Validate availability and record evidence
 
-Record non-secret results in the final README/submission email: UTC time, node
-count/versions, Application status, `kubectl top`, NFD labels, the tested public
-URL(s), and the Git commit. Never include raw admin kubeconfig or secrets.
+Record non-secret results in the README/submission email: UTC time, node
+count/versions, Application status, `kubectl top`, NFD labels, tested public
+URL(s), and Git commit. Never include raw admin kubeconfig or secrets. Review
+[validation coverage](README.md#validation-coverage) and
+[known limits](README.md#known-limits); record results under [status](README.md#status).
 
-Set up the SSH tunnel in section 4 and run the read-only live checks from the
-repository root. The script uses the production inventory's `artifacts/admin.conf`
-and `artifacts/kubectl`; the default excludes `clusterdos-config` and nginx.
+Set up the [SSH tunnel](#workstation-api-connectivity-and-manual-switching) and
+run the read-only live checks from the repository root:
 
 ```bash
 .venv/bin/python tests/check_acceptance.py inventory/production/hosts.yaml --server https://127.0.0.1:16443
@@ -644,38 +492,39 @@ and `artifacts/kubectl`; the default excludes `clusterdos-config` and nginx.
 .venv/bin/python tests/check_acceptance.py inventory/production/hosts.yaml --server https://127.0.0.1:16443 --nginx
 ```
 
-`--nginx` also checks both Applications and public HTTP. Run the HTTP checks from
-outside the provider's private network. These read-only checks do not replace the
-disruptive failure tests below; do not infer failover from healthy replicas alone.
+Run HTTP checks from outside the provider's private network. Do not infer
+failover from healthy replicas alone.
 
-With explicit permission for a disruptive test, stop **one** node via the provider
-console (not two). Manually select each surviving API endpoint; require `/readyz`
-and a successful API write (create/delete a temporary ConfigMap in `default`).
-From each surviving node, check its local API using `/etc/kubernetes/admin.conf`
-and require its kubelet/Cilium to remain healthy. Inspect the `default/kubernetes`
-EndpointSlice, pod API connectivity, Argo recovery and nginx curls through surviving
-public addresses. There is no VIP takeover to test in this design.
+Only with explicit permission for a disruptive test and a verified provider
+console recovery path, stop **one** node (not two). Manually select each surviving
+API endpoint; require `/readyz` and a successful API write by creating/deleting a
+temporary ConfigMap in `default`. From each surviving node, check its local API
+using `/etc/kubernetes/admin.conf` and require kubelet/Cilium to remain healthy.
+Inspect the `default/kubernetes` EndpointSlice, pod API connectivity, Argo recovery
+and nginx curls through surviving public addresses.
 
-Restore the node and require it to return Ready before any next test. A cordon/drain
-does not simulate losing etcd/apiserver and is not proof of control-plane failover.
-Record recovery time and any outage; do not assert zero downtime without measurements.
-Separately test local apiserver-only failure with approval: document that its host
-clients wait for static-pod recovery rather than falling back to another node.
-Skip disruptive tests without permission and state failover is unverified.
+Restore the node and require it to return Ready before any next test. Do not use
+cordon/drain as proof of control-plane failover. Record recovery time and any
+outage; do not assert zero downtime without measurements. With separate approval,
+test local apiserver-only failure and measure host-client recovery. Skip disruptive
+tests without permission or a recovery path, and record failover as unverified.
+See [status](README.md#status) for the existing test decision.
 
-## 9. Encrypt admin kubeconfig for all three reviewers
+## 10. Encrypt admin kubeconfig for all three reviewers
 
 First agree a reachable API path. Copy the generated admin kubeconfig to
-`.local/share-admin.kubeconfig`, select a tested public node endpoint using the
-instructions in section 4, and list all three endpoints and switching steps in
-the handoff. The API SANs must cover each public address. For SSH-only access,
-select the localhost tunnel endpoint and supply tunnel instructions and verified
-SSH access to all reviewers; do not send that config without those instructions.
+`.local/share-admin.kubeconfig`, select a tested public node endpoint using
+[the API access procedure](#workstation-api-connectivity-and-manual-switching),
+and list all three endpoints and switching steps in the handoff. Confirm API SANs
+cover each public address. For SSH-only access, select the localhost tunnel
+endpoint and supply tunnel instructions and verified SSH access to all reviewers.
+Do not send the config without those instructions. Review
+[remaining handoff](README.md#remaining-handoff) before proceeding.
 
-Use the email's three **public** key attachments; private keys are never needed.
+Use the email's three **public** key attachments; never request private keys.
 Authenticate each full primary fingerprint with Christian, Yoofi and Sasi over a
-trusted independent channel. A UID/name/email in a key is not proof of identity.
-The same ciphertext must contain three recipients, not only the last one.
+trusted independent channel. Do not trust identity based on a UID/name/email alone.
+Encrypt the same ciphertext to all three recipients:
 
 ```bash
 umask 077
@@ -703,13 +552,11 @@ gpg --batch --armor --encrypt --trust-model always \
 gpg --list-packets "$ROOT/.local/aranya-admin.kubeconfig.asc"
 ```
 
-`--trust-model always` is appropriate **only after** manually authenticating the
-three fingerprints; it is not a shortcut around verification. GPG must select an
-unexpired encryption-capable subkey for each recipient. Inspect the three public
-key encrypted-session packets and compare their key IDs to the authenticated
-keys' encryption subkeys. No recipient private key is present locally, so local
-packet inspection does not prove decryption; ask **each** reviewer to decrypt and
-confirm `kubectl get nodes` works:
+Use `--trust-model always` **only after** manually authenticating all fingerprints.
+Verify GPG selects an unexpired encryption-capable subkey for each recipient.
+Inspect all three public-key encrypted-session packets and compare their key IDs
+to the authenticated encryption subkeys. Do not treat packet inspection as proof
+of decryption. Ask **each** reviewer to decrypt and confirm `kubectl get nodes`:
 
 ```bash
 umask 077
@@ -719,32 +566,34 @@ KUBECONFIG="$PWD/aranya-admin.kubeconfig" kubectl get nodes
 ```
 
 Never run `kubectl config view --raw` in shared logs or attach plaintext kubeconfig.
-These credentials are cluster-admin, not read-only. If leaked, treat it as an
-incident; replacing a file does not revoke a issued client certificate. Rebuild
-this disposable cluster or follow a deliberate CA rotation/revocation strategy.
+Treat an admin credential leak as an incident; replacing a file does not revoke
+an issued client certificate. Rebuild this disposable cluster or follow a deliberate
+CA rotation/revocation strategy. See [known limits](README.md#known-limits) for
+shared-admin identity implications.
 
-## 10. Final email checklist
+## 11. Final email checklist
 
-After live validation, reply manually in the original thread with:
+After live validation and approval to send, reply manually in the original thread
+with:
 - public repository link and exact submission commit;
 - public nginx URL and brief verification summary;
-- `RUNBOOK.md` attached (replace remaining inputs with authorized non-secret
-  values or reference the separately supplied inventory/private data);
+- `RUNBOOK.md` attached, alongside the README for linked context; reference
+  separately supplied authorized inventory/private inputs;
 - `.local/aranya-admin.kubeconfig.asc` attached, encrypted to all three reviewers;
-- API connectivity instructions and any remaining availability/security limitations.
+- API connectivity instructions and [remaining limitations](README.md#known-limits).
 
-Do not publish the encrypted kubeconfig in Git. Publication to the specified
-`takehome` branch is approved; do not send email or change reviewer access without
-explicit approval. Reviewer access and encrypted handoff are outstanding, so this
-is **not yet a completed take-home submission**.
+Do not publish the encrypted kubeconfig in Git. Obtain explicit approval before
+sending email or changing reviewer access. Check
+[remaining handoff](README.md#remaining-handoff) and [status](README.md#status)
+before describing the assignment as complete.
 
 ## Operations and troubleshooting
 
 - **Kubespray failure:** check OS/Python/sudo/host-key and private routes first;
-  read the failed task, fix the cause, rerun pinned `cluster.yml`. Do not run reset
-  to paper over a failed deployment.
+  read the failed task, fix the cause, rerun the pinned deployment wrapper. Do not
+  run reset to paper over a failed deployment.
 - **Pending Argo/nginx pods:** check taints, node memory, spread/anti-affinity and
-  `kubectl describe pod`; all three nodes must be schedulable for HA Redis.
+  `kubectl describe pod`; keep all three nodes schedulable for HA Redis.
 - **Argo OutOfSync/Error:** inspect `kubectl -n argocd describe application NAME`
   and repo-server/application-controller logs; verify public repo/ref/path and
   reachable Helm repositories. Avoid manual changes that auto-sync will undo.
@@ -757,18 +606,17 @@ is **not yet a completed take-home submission**.
 - **Backup:** before upgrades, take and verify an etcd snapshot using the
   [etcd recovery guidance](https://etcd.io/docs/v3.6/op-guide/recovery/), with the
   deployed etcd endpoint and TLS credentials, then store an encrypted copy off-node.
-  Etcd backups contain Secrets. Schedule and test restores before describing a
-  longer-lived cluster as production ready. Kubespray's
+  Protect backups as secrets; schedule and test restores before describing a
+  longer-lived cluster as production ready. Do not use Kubespray's disruptive
   [control-plane recovery playbook](https://github.com/kubernetes-sigs/kubespray/blob/v2.32.0/docs/operations/recover-control-plane.md)
-  is disruptive and is not a substitute for a tested backup.
+  as a substitute for a tested backup.
 - **Upgrade:** review supported Kubespray/Kubernetes versions, back up etcd, test
   in disposable infrastructure, then use the pinned upstream upgrade playbook.
   Separate cluster upgrades from clusterdOS/chart upgrades.
-- **Rebuild/teardown:** reset destroys cluster state. Prefer fresh provider nodes
-  for reproduction. Only after explicit approval, correct inventory verification
-  and any needed backup use Kubespray `reset.yml`; never put a destructive reset
-  in an automatic bootstrap path. Revoke take-home network/SSH access with the
-  owner after evaluation.
+- **Rebuild/teardown:** prefer fresh provider nodes for reproduction. Use Kubespray
+  `reset.yml` only after explicit approval, correct inventory verification and any
+  needed backup; never put destructive reset in an automatic bootstrap path.
+  Revoke take-home network/SSH access with the owner after evaluation.
 
 ### References
 
