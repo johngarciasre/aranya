@@ -11,8 +11,8 @@ spec:
     name: in-cluster
     namespace: hello-aranya
   source:
-    repoURL: https://github.com/REPLACE_ME/aranya.git
-    targetRevision: REPLACE_WITH_COMMIT_SHA
+    repoURL: https://github.com/johngarciasre/aranya.git
+    targetRevision: 153915629b15f772ea88ada63556c148768d22d0
     path: manifests/nginx
   syncPolicy:
     automated:
