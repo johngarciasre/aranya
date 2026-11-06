@@ -47,7 +47,7 @@
     - name: Render isolated firewall table
       ansible.builtin.template:
         src: templates/firewall.nft.j2
-        dest: /etc/aranya-firewall.nft
+        dest: /etc/aranya-firewall.candidate.nft
         mode: '0600'
         validate: /usr/sbin/nft --check --file %s
 
@@ -77,6 +77,13 @@
           - --on-active=180s
           - /etc/aranya-firewall-rollback.sh
       changed_when: true
+
+    - name: Install validated firewall configuration
+      ansible.builtin.copy:
+        src: /etc/aranya-firewall.candidate.nft
+        dest: /etc/aranya-firewall.nft
+        remote_src: true
+        mode: '0600'
 
     - name: Activate firewall and enable persistence
       ansible.builtin.systemd_service:

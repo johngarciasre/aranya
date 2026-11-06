@@ -25,6 +25,8 @@ spec:
             repoURL: https://github.com/johngarciasre/aranya.git
             targetRevision: 153915629b15f772ea88ada63556c148768d22d0
             path: charts/config
+            values:
+              clustername: aranya-takehome
           argo:
             enabled: false
           cilium:

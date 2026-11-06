@@ -68,6 +68,7 @@ def check(container):
     source = install["spec"]["source"]
     values = source["helm"]["valuesObject"]
     assert values["clusterdos"]["clustername"] == "aranya-takehome"
+    assert values["gitapps"]["config"]["values"]["clustername"] == values["clusterdos"]["clustername"]
     assert source["targetRevision"] == values["clusterdos"]["ref"] == "v0.4.8"
     chart = str(CLUSTERDOS / source["path"])
     run(str(HELM), "lint", chart, "-f", "-", input=yaml.safe_dump(values))

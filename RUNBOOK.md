@@ -2,23 +2,24 @@
 
 ## Status and scope
 
-**The cluster and required addons are installed; config repair, publication,
-nginx and end-to-end acceptance remain pending.** Three Kubernetes v1.36.4 nodes
-are Ready, Cilium is 3/3 and its operator is 2/2. Argo CD v3.6.1 workloads are
-Ready: Redis 3/3, server and repo-server 2/2 each, and controller 1/1. The
-clusterdOS parent and cert-manager, metrics-server and NFD Applications are
-Synced/Healthy. The metrics APIService is Available with TLS verification,
-`kubectl top` works, and NFD reports Intel CPU vendor labels on all three nodes.
+**The cluster, required addons and nginx are deployed; disruptive failover and
+reviewer handoff remain pending.** On 2026-11-06 UTC three Kubernetes v1.36.4
+nodes were Ready, Cilium was 3/3 and its operator 2/2. Argo CD v3.6.1 workloads
+were Ready: Redis 3/3, server and repo-server 2/2 each, and controller 1/1. All
+six Applications were Synced/Healthy. The metrics APIService was Available with
+TLS verification, `kubectl top` worked, and NFD reported Intel CPU vendor labels
+on all three nodes. Three nginx pods were Ready on separate nodes and public HTTP
+returned `hello aranya` from all three addresses.
 
-`clusterdos-config` is Unknown with ComparisonError: the upstream v0.4.8 chart
-uses unsupported `apiVersion: v3`. The corrected vendored chart and `install.yaml`
-override are prepared but must be published and applied. Host firewall protection
-is active, and preinstall listeners verified private paths and public filtering.
-Public HTTP, failover, GPG encryption, recipient decryption and email handoff
-remain unverified. The private production inventory contains the supplied node
-addresses and SSH settings; the public example remains parameterized. BGP and
-kube-vip are disabled; external clients switch node endpoints manually or provide
-their own load balancer.
+The vendored config chart fixes upstream v0.4.8's unsupported `apiVersion: v3`;
+an explicit cluster name also ensures Argo's Helm 4 passes the value. Host
+firewall protection and the revised rollback playbook are installed; public etcd,
+API and kubelet ports were filtered. The rollback script was not tested by
+inducing an SSH lockout. Failover, reviewer access, GPG encryption, recipient
+decryption and email handoff remain unverified. The private production inventory
+contains node addresses and SSH settings; the public example remains parameterized.
+BGP and kube-vip are disabled; external clients switch node endpoints manually or
+provide their own load balancer.
 
 This runbook starts with provider-provisioned, fresh Linux servers (the email
 supplies servers, so provisioning VMs is outside its scope). Kubespray installs
@@ -41,12 +42,11 @@ Git. Run commands in Bash on the operator workstation, except where stated.
   apiservers and etcd quorum; external clients manually select a surviving node.
 - Argo CD uses the upstream HA install bundle; clusterdOS manages cert-manager,
   metrics-server and NFD. Disable its `argo` and `cilium` gitapps to prevent two
-  tools managing those components. Once published and applied, the override directs
-  the enabled `config` gitapp to the vendored chart instead of the broken upstream chart.
-- The nginx design spreads three pods across nodes, with resource bounds, HTTP
-  probes, restricted pod security and a PDB. A NodePort exposes HTTP at
-  `http://NODE_PUBLIC_IP:30080/` without assuming a cloud load-balancer controller;
-  deployment and public reachability remain to be verified.
+  tools managing those components. The override directs the enabled `config`
+  gitapp to the vendored chart instead of the broken upstream chart.
+- Three nginx pods are spread across nodes, with resource bounds, HTTP probes,
+  restricted pod security and a PDB. A NodePort exposes HTTP at
+  `http://NODE_PUBLIC_IP:30080/` without assuming a cloud load-balancer controller.
 
 ### Known limits
 
@@ -266,17 +266,18 @@ Validate the real inventory before provisioning:
 
 The deployment entry point in section 4 imports `firewall.yaml` first, then the
 pinned Kubespray playbook. `nft` and `systemd-run` must already be installed. The
-firewall play validates rules and operates one host at a time. Before activation,
-it installs `/etc/aranya-firewall-rollback.sh` and arms a 180-second timer. On a
-rerun it first saves `/etc/aranya-firewall.nft` as
-`/etc/aranya-firewall.previous.nft`; if reconnection is not verified, the script
+firewall play validates a candidate rules file and operates one host at a time.
+Before replacing the active configuration, it installs
+`/etc/aranya-firewall-rollback.sh` and arms a 180-second timer. On a rerun it first
+saves `/etc/aranya-firewall.nft` as `/etc/aranya-firewall.previous.nft`; if
+reconnection is not verified, the script
 restores that configuration, reloads its rules and enables its persistent service.
 On first installation, the script disables the Aranya firewall service instead to
 recover SSH. The play closes the existing SSH connection, verifies a new one and
 only then cancels the timer. A firewall failure stops deployment. A rerun atomically
 replaces only its own table; review existing firewall policy before using it on
-non-fresh nodes. The revised rollback behavior is prepared locally; do not assume
-it has been deployed to the nodes without verification.
+non-fresh nodes. The revised playbook was applied successfully to all three nodes;
+its rollback path was syntax-checked but not exercised by inducing a lockout.
 
 Optionally, with approval on fresh nodes, apply the firewall separately and test
 ports before the combined deployment. The combined deployment will apply it again.
@@ -413,8 +414,8 @@ certificate rotation is distinct and remains enabled by Kubespray.
 Use server-side apply for the large Argo CRDs. Initial installation is into a fresh
 namespace; this does not authorize overwriting an existing Argo installation.
 The current cluster already has Argo CD and clusterdOS installed. For a fresh
-install, publish and pin the config chart as described in section 7 before applying
-`install.yaml`; its placeholder SHA cannot be resolved by Argo.
+install, confirm that the pinned config chart commit is accessible before applying
+`install.yaml`; for a fork, publish and pin its chart as described in section 7.
 
 ```bash
 "$KUBECTL" create namespace argocd --dry-run=client -o yaml | "$KUBECTL" apply -f -
@@ -434,8 +435,8 @@ Argo's HA Redis pods need three schedulable nodes; inspect Pending pods/events
 instead of reducing redundancy silently. clusterdOS creates child Applications:
 `clusterdos-config`, `clusterdos-certmanager`, `clusterdos-metricsserver`,
 `clusterdos-nfd`. All must become Synced/Healthy; inspect their status and logs
-if not. On the current cluster, `clusterdos-config` is Unknown/ComparisonError
-because upstream's chart uses `apiVersion: v3`, which Helm does not support.
+if not. The upstream config chart uses `apiVersion: v3`, which Helm does not
+support, so it must use the vendored correction described below.
 
 `charts/config` vendors the v0.4.8 config chart at upstream commit
 `92a191cdb1ecda83c25d9d218fce3dd3f7b2ba1c`; its only chart change is
@@ -443,8 +444,10 @@ because upstream's chart uses `apiVersion: v3`, which Helm does not support.
 unchanged; the directory also contains the upstream GPLv3 license and provenance
 README. `install.yaml` redirects only `gitapps.config` with `internal: false` to
 `https://github.com/johngarciasre/aranya.git`, path `charts/config`, at a pinned
-commit. Publish that commit and apply the override using section 7. Remove the
-override only after verifying a later upstream release fixes and renders the chart.
+commit. It explicitly sets `gitapps.config.values.clustername` to the parent
+cluster name: Helm 4 omits the default null map, bypassing upstream's injection.
+Keep both names equal. Remove the override only after verifying a later upstream
+release fixes and renders the chart.
 
 ```bash
 "$KUBECTL" -n argocd get applications
@@ -495,11 +498,11 @@ SSH/GPG keys, plaintext/encrypted kubeconfigs or credential attachments. The
 public `inventory/example` is intentionally non-secret. You may publish sanitized
 real inventory/network values only if authorized; never embed SSH passwords.
 
-Publication to `https://github.com/johngarciasre/aranya` on the **takehome**
-feature branch is approved, but the repository is not yet published. Start the
-sequence below only after the files are ready for review. For this currently
-uninitialized checkout, initialize Git on `takehome`; do not reinitialize an
-existing repository or commit to `main`.
+The public repository is `https://github.com/johngarciasre/aranya`, with `takehome`
+as its default branch. The config chart and nginx sources are pinned to published
+commit `153915629b15f772ea88ada63556c148768d22d0`. The commands below illustrate
+initial publication for a separate fresh checkout only; do not reinitialize this
+repository or commit to `main`. Review any subsequent publication separately.
 
 ```bash
 git init -b takehome
@@ -517,16 +520,13 @@ git push -u origin takehome
 git rev-parse HEAD
 ```
 
-Record that **initial published commit's full SHA**. It contains both `charts/config`
-and `manifests/nginx`; the initial Application placeholders are not deployable.
-Replace `REPLACE_WITH_CONFIG_COMMIT_SHA` in `install.yaml` and
-`REPLACE_WITH_COMMIT_SHA` in `argocd/nginx.yaml` with that SHA. Ensure nginx's
-`repoURL` is `https://github.com/johngarciasre/aranya.git`. Review, commit and push
-these pointer changes on `takehome` before applying either Application. The pointer
-commit references the preceding published commit rather than itself. Future chart or
-nginx changes similarly require a published content commit and a pointer update;
-fixed SHAs do not follow the branch. Set the remote default branch to the submission
-branch as appropriate; never commit to `main` without express orders.
+The current `install.yaml` and `argocd/nginx.yaml` already pin the published
+content commit shown above. For a fork or new revision, first publish a commit
+containing `charts/config` and `manifests/nginx`, then update each Application's
+repository URL and full content SHA. Review, commit and push those pointer changes
+before applying either Application. A pointer commit references the preceding
+published content commit rather than itself. Future chart or nginx changes similarly
+require a content commit and a pointer update; fixed SHAs do not follow the branch.
 
 Apply the pinned config override and verify that the formerly failing Application
 becomes Synced/Healthy:
@@ -677,8 +677,8 @@ After live validation, reply manually in the original thread with:
 
 Do not publish the encrypted kubeconfig in Git. Publication to the specified
 `takehome` branch is approved; do not send email or change reviewer access without
-explicit approval. With placeholders still present and acceptance outstanding,
-this is **not yet a completed take-home submission**.
+explicit approval. Reviewer access and encrypted handoff are outstanding, so this
+is **not yet a completed take-home submission**.
 
 ## Operations and troubleshooting
 

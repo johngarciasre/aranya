@@ -37,7 +37,12 @@ assert playbook['serial'] == 1
 assert playbook['any_errors_fatal'] is True
 names = [task['name'] for task in playbook['tasks']]
 assert names.index('Preserve previous firewall configuration') < names.index('Render isolated firewall table')
-assert names.index('Arm lockout rollback before activation') < names.index('Activate firewall and enable persistence')
+assert names.index('Render isolated firewall table') < names.index('Arm lockout rollback before activation')
+assert names.index('Arm lockout rollback before activation') < names.index('Install validated firewall configuration') < names.index('Activate firewall and enable persistence')
+render = next(task['ansible.builtin.template'] for task in playbook['tasks'] if task['name'] == 'Render isolated firewall table')
+install = next(task['ansible.builtin.copy'] for task in playbook['tasks'] if task['name'] == 'Install validated firewall configuration')
+assert render['dest'] == install['src'] == '/etc/aranya-firewall.candidate.nft'
+assert install['dest'] == '/etc/aranya-firewall.nft'
 assert names.index('Verify a new authenticated connection') < names.index('Cancel rollback after reconnecting')
 rollback = next(task['ansible.builtin.copy']['content'] for task in playbook['tasks']
                 if task['name'] == 'Install lockout rollback')

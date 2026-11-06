@@ -3,25 +3,21 @@
 A reproducible three-node Kubespray deployment with private Cilium networking,
 Argo CD, clusterdOS and an nginx `hello aranya` service. BGP and kube-vip are disabled.
 
-**Status: cluster and required addons installed; config repair, publication,
-nginx and end-to-end acceptance remain pending.** All three Kubernetes v1.36.4
-nodes are Ready, Cilium is 3/3 and its operator is 2/2. Argo CD v3.6.1 workloads
-are Ready: Redis 3/3, server and repo-server 2/2 each, and controller 1/1. The
-clusterdOS parent and cert-manager, metrics-server and NFD Applications are
-Synced/Healthy. The metrics APIService is Available with TLS verification and
-`kubectl top` works; NFD reports Intel CPU vendor labels on all three nodes.
+**Status: cluster, addons and nginx are deployed; failure testing and reviewer
+handoff remain pending.** On 2026-11-06 UTC all three Kubernetes v1.36.4 nodes
+were Ready, Cilium was 3/3 and its operator 2/2. Argo CD v3.6.1 workloads were
+Ready: Redis 3/3, server and repo-server 2/2 each, and controller 1/1. All six
+Applications, including clusterdOS and nginx, were Synced/Healthy. The metrics
+APIService was Available with TLS verification and `kubectl top` worked; NFD
+reported Intel CPU vendor labels on all three nodes. Nginx had three Ready pods,
+one per node; public HTTP returned `hello aranya` on all three node addresses.
 
-`clusterdos-config` is Unknown with ComparisonError because upstream v0.4.8 uses
-unsupported `apiVersion: v3` in its chart. The corrected vendored chart and
-`install.yaml` override must be published and applied before this is resolved.
-Persistent nftables host protection is active on all nodes; preinstall listeners
-verified private paths and public filtering. The updated firewall playbook saves
-previous rules before changes and uses a timed rollback: it restores those rules
-and persistence on reruns, or disables its service on first installation to recover
-SSH. It verifies a fresh connection serially before canceling the timer. The revised
-rollback is prepared locally; its deployment to the nodes is not yet verified.
-The public repository and nginx have not yet been published/deployed; public HTTP,
-failover, GPG encryption, recipient decryption and email handoff remain unverified.
+Upstream clusterdOS v0.4.8 uses unsupported `apiVersion: v3` for its config chart;
+the vendored fix and an explicit cluster name restore reconciliation. Persistent
+nftables host protection and the revised rollback playbook were applied serially
+on all nodes. Public etcd, API and kubelet ports were filtered. The rollback script
+was not tested by inducing an SSH lockout. Failover, reviewer access, GPG encryption,
+recipient decryption and email handoff remain unverified.
 
 ## Contents
 
@@ -30,9 +26,9 @@ failover, GPG encryption, recipient decryption and email handoff remain unverifi
 | [RUNBOOK.md](RUNBOOK.md) | Prerequisites, bootstrap, publication, live checks, endpoint switching, GPG handoff and operations |
 | [inventory/example/hosts.yaml](inventory/example/hosts.yaml) | Three stacked control-plane/etcd nodes; public SSH, private cluster traffic |
 | [inventory/example/group_vars](inventory/example/group_vars) | Cilium, Kubernetes, API SANs and kubelet certificate settings; no VIP |
-| [install.yaml](install.yaml) | clusterdOS Argo Application with required gitapps and config chart override; SHA pending |
+| [install.yaml](install.yaml) | clusterdOS Argo Application with required gitapps and pinned config chart override |
 | [charts/config](charts/config) | Vendored clusterdOS v0.4.8 config chart with corrected Helm API version, upstream license and provenance |
-| [argocd/nginx.yaml](argocd/nginx.yaml) | GitOps Application; pin repository and manifest commit SHA before applying |
+| [argocd/nginx.yaml](argocd/nginx.yaml) | GitOps Application pinned to the published nginx manifest commit |
 | [manifests/nginx/resources.yaml](manifests/nginx/resources.yaml) | Restricted nginx pods, page/config, NodePort 30080 and disruption budget |
 | [requirements.lock](requirements.lock) | Pinned Ansible/Python provisioning dependencies |
 | [tests/check.py](tests/check.py) | Local inventory, syntax, chart and optional nginx runtime checks |
@@ -57,11 +53,11 @@ failover, GPG encryption, recipient decryption and email handoff remain unverifi
   balancer. All public node IPs are included in production API certificate SANs.
 - Argo CD's pinned HA bundle bootstraps clusterdOS v0.4.8. Required gitapps are
   `certmanager`, `metricsserver` and `nfd`; unnecessary apps remain disabled.
-  The `config` gitapp is redirected to the vendored chart once its commit is published.
+  The `config` gitapp is redirected to the published vendored chart.
 - metrics-server verifies kubelet TLS and uses cert-manager for its own serving
   certificate/aggregated API CA injection. Kubelet serving CSRs need individually
   verified approval; no blanket insecure TLS workaround is included.
-- The nginx design specifies three replicas serving HTTP on each node's public
+- Three nginx replicas serve HTTP on each node's public
   port **30080**. The container runs non-root with a read-only filesystem, probes
   and resource bounds. HTTP clients also switch to a surviving node manually.
   One fixed public node URL is not an automatically failing-over endpoint.
@@ -97,20 +93,14 @@ With an authenticated SSH tunnel on localhost, run the read-only live checks:
 The default excludes `clusterdos-config` and nginx; `--nginx` also checks both
 Applications and public HTTP. These checks do not prove failover.
 
-Live node, Cilium, Argo and addon health were checked as described above, but
-`clusterdos-config` remains in error. Public HTTP, failover and recipient
-decryption remain unverified. Local checks do not prove deployed HA.
+Full non-disruptive live acceptance passed on 2026-11-06 UTC. It does not prove
+failover or recipient decryption. The config chart and nginx manifest source commit
+is `153915629b15f772ea88ada63556c148768d22d0` on the public `takehome` branch.
 
 ## Complete the assignment
 
-1. Publish the approved `takehome` feature branch to
-   [johngarciasre/aranya](https://github.com/johngarciasre/aranya), with the chart
-   and nginx manifests in an initial commit. Pin both `install.yaml`'s config
-   `targetRevision` and nginx's `targetRevision` to that published commit, and
-   ensure nginx's repository URL is `https://github.com/johngarciasre/aranya.git`.
-2. Apply the updated `install.yaml`; verify `clusterdos-config` is Synced/Healthy.
-   Deploy nginx and collect live addon, API and public HTTP evidence. Obtain
-   approval for disruptive failure tests.
+1. Obtain approval for disruptive failure tests; restore any stopped node afterward.
+2. Agree and provision reviewer access; public API and unauthorized SSH remain blocked.
 3. Authenticate all three reviewer GPG fingerprints, encrypt a tested admin
    kubeconfig to all three recipients, and supply manual API switching instructions.
 4. With approval, attach the final runbook and encrypted kubeconfig in the
