@@ -11,7 +11,7 @@ import yaml
 
 
 root = Path(__file__).resolve().parents[1]
-inventory_path = sys.argv[1] if len(sys.argv) > 1 else str(root / 'inventory/example/hosts.yaml')
+inventory_path = str(Path(sys.argv[1]).resolve()) if len(sys.argv) > 1 else str(root / 'inventory/example/hosts.yaml')
 inventory = json.loads(subprocess.check_output([
     str(root / '.venv/bin/ansible-inventory'),
     '-i', inventory_path, '--list',
@@ -28,7 +28,9 @@ assert 'tcp dport 30080 accept' in rules
 assert 'ct original proto-dst 30080 accept' in rules
 assert 'tcp dport 6443 accept' not in rules
 assert 'tcp dport 22 accept' in rules
-assert 'iifname "eth0" drop' in rules
+assert '\n    tcp dport 22 accept' not in rules
+assert '\n    tcp dport 2026 accept' in rules
+assert f'iifname "{variables["firewall_public_interface"]}" drop' in rules
 for host in hosts.values():
     assert host['ip'] in rules
     assert host['firewall_admin_sources'] == variables['firewall_admin_sources']
@@ -44,6 +46,21 @@ install = next(task['ansible.builtin.copy'] for task in playbook['tasks'] if tas
 assert render['dest'] == install['src'] == '/etc/aranya-firewall.candidate.nft'
 assert install['dest'] == '/etc/aranya-firewall.nft'
 assert names.index('Verify a new authenticated connection') < names.index('Cancel rollback after reconnecting')
+ssh_config = next(task['ansible.builtin.copy'] for task in playbook['tasks']
+                  if task['name'] == 'Configure both SSH ports with key-only authentication')
+assert ssh_config['content'].splitlines() == [
+    'Port 22', 'Port 2026', 'PasswordAuthentication no', 'KbdInteractiveAuthentication no',
+]
+assert ssh_config['validate'] == '/usr/sbin/sshd -t -f %s'
+socket_config = next(task['ansible.builtin.copy']['content'] for task in playbook['tasks']
+                     if task['name'] == 'Configure both socket-activated SSH listeners')
+assert socket_config.splitlines() == [
+    '[Socket]', 'ListenStream=', 'ListenStream=0.0.0.0:22', 'ListenStream=[::]:22',
+    'ListenStream=0.0.0.0:2026', 'ListenStream=[::]:2026',
+]
+assert names.index('Validate complete SSH configuration') < names.index('Refresh socket-activated SSH without terminating existing sessions')
+port_check = next(task for task in playbook['tasks'] if task['name'] == 'Verify authenticated SSH on port 2026')
+assert port_check['vars']['ansible_port'] == 2026
 rollback = next(task['ansible.builtin.copy']['content'] for task in playbook['tasks']
                 if task['name'] == 'Install lockout rollback')
 for exists in (False, True):

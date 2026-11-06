@@ -83,15 +83,16 @@ Confirm with the provider/assignment owner:
 5. Firewall rules below exist at the provider and/or OS layer. Kubespray is not
    a provider-firewall manager. Keep the firewall; do not blindly disable it.
 6. Operator workstation: Linux, Python 3.12 with venv/pip, Git, curl, tar,
-   sha256sum, OpenSSH, OpenSSL and GnuPG. Podman is optional for the smoke test.
+   sha256sum, OpenSSH, OpenSSL, GnuPG and `envsubst`. Podman is optional for the smoke test.
    On Ubuntu, install missing prerequisites only after reviewing their impact:
-   `sudo apt-get install python3-venv python3-pip git curl openssh-client openssl gnupg`.
+   `sudo apt-get install python3-venv python3-pip git curl openssh-client openssl gnupg gettext-base`.
 
 ### Firewall policy
 
 | Path | Allow | Restriction |
 | --- | --- | --- |
-| Operator/reviewer -> node | TCP 22 | Only authenticated operator/reviewer source IPs |
+| Operator/reviewer -> node | TCP 22 | Only authorized operator/reviewer source IPs; SSH key required |
+| Internet -> node | TCP 2026 | Public SSH; authorized key required, password/keyboard-interactive authentication disabled |
 | Internet -> node | TCP 30080 | Only intended public HTTP service |
 | Operator/reviewer -> public API | TCP 6443 | Only authorized source IPs; omit for SSH-only access |
 | Private nodes -> API | TCP 6443 | Cluster node addresses |
@@ -118,6 +119,12 @@ closed; use SSH tunnels initially. ICMP/IPv6 neighbor discovery and established
 connections remain allowed. This assumes the current IPv4 cluster and standard
 kube-proxy NAT path; rerun live HTTP and filtering tests after Cilium installation.
 
+The same serial playbook configures SSH on both 22 and 2026, including Ubuntu's
+`ssh.socket` listeners. Port 2026 is deliberately open to all sources; port 22
+retains its source allowlist. It validates SSH configuration before restarting
+listeners, preserves existing authenticated sessions, then verifies fresh SSH
+connections on both ports. Existing authorized keys are unchanged.
+
 ## 2. Versions and workstation setup
 
 | Component | Pin |
@@ -139,13 +146,12 @@ Argo 3.6 documents testing against Kubernetes 1.34-1.37. Do not use upstream
 The nginx image digest is amd64-specific; choose and verify the appropriate digest
 before using ARM nodes. `requirements.lock` records all resolved Python dependencies.
 
-After publication, clone the submission repository and replace the revision with
-its full submission commit SHA:
+Clone the submission's `main` branch at its current head; no commit SHA
+substitution is required. Tag `v0.1.0` identifies the initial release:
 
 ```bash
-git clone https://github.com/johngarciasre/aranya.git
+git clone --branch main https://github.com/johngarciasre/aranya.git
 cd aranya
-git checkout REPLACE_WITH_SUBMISSION_COMMIT
 export ROOT="$PWD"
 umask 077
 mkdir -p "$ROOT/.cache" "$ROOT/.local"
@@ -188,33 +194,72 @@ to fail. They never contact cluster nodes. Upstream syntax checking may warn abo
 unused `bastion`, `calico_rr` and `_kubespray_needs_etcd` groups. These are not
 deployment validation.
 
-## 3. Fill the inventory
+## 3. Supply environment-specific inventory inputs
 
-For a fresh checkout only; reuse an existing production inventory without copying
-over it. The current workstation already has the supplied production inventory.
+The checked-in inventory is an example only. Supply **11 required values** in a
+private Bash environment file: six node IPs (three public SSH IPs and three private
+cluster IPs), Ansible SSH username and key path, a comma-separated list of
+operator IPv4 addresses for the firewall, and the private/public interface names.
+Two subnet inputs have defaults but must be changed if they overlap your network.
+The template derives each `access_ip` from its private IP, the API SAN list from
+the three public IPs, and firewall YAML from the comma-separated source list. The
+sample contains documentation-only addresses and is not ready to deploy.
+
+Create the private inputs file, review the sample, and replace its example values
+with those for your environment (the subnet defaults can be kept if suitable):
 
 ```bash
-test ! -e "$ROOT/inventory/production" && cp -R "$ROOT/inventory/example" "$ROOT/inventory/production"
-export INVENTORY="$ROOT/inventory/production/hosts.yaml"
-export SSH_KEY="$HOME/.ssh/REPLACE_WITH_ASSIGNMENT_KEY"
-chmod 600 "$SSH_KEY"
+test ! -e "$ROOT/.local/production.env" && cp "$ROOT/inventory/production.env.example" "$ROOT/.local/production.env"
+chmod 600 "$ROOT/.local/production.env"
+# Edit .local/production.env with your assigned node and operator values.
 ```
 
-Edit the production files, not `.cache/kubespray/inventory/sample`:
+The input file is sourced as Bash; use only a file you created and trust. Its
+`SSH_KEY` value must be an absolute path and may use `$HOME`, as shown in the
+sample. Install `envsubst` if it is missing (`sudo apt-get install gettext-base`).
+Then render the private production inventory from the file:
 
-| File/field | Required input |
+```bash
+set -a
+source "$ROOT/.local/production.env"
+set +a
+bash "$ROOT/scripts/render_inventory.sh"
+export INVENTORY="$ROOT/inventory/production/hosts.yaml"
+```
+
+Alternatively export all 11 variables directly in the shell and run the renderer;
+no file is required. To have the renderer source a trusted file itself, pass its
+path as the first argument.
+
+The renderer refuses to overwrite an existing production inventory, checks that
+all 11 required values are present, validates IPv4 addresses, unique node
+addresses, RFC1918 private IPs, firewall source addresses, distinct interfaces,
+and pod/service subnet overlap, then renders and YAML-parses the files. It cannot
+check overlap with networks you do not provide. Output is git-ignored and
+mode-restricted.
+
+The current workstation already has an existing production inventory. To change
+inputs, first move or remove only the generated `inventory/production` directory
+after verifying it contains no needed artifacts; the renderer will not overwrite
+it. Review the result privately before provisioning. Use the example files for
+non-sensitive Kubespray syntax and local checks, not as real deployment data.
+
+These are the 11 environment inputs:
+
+| Variable(s) | Meaning |
 | --- | --- |
-| `hosts.yaml`: `ansible_host` | Node's public SSH IP; examples `192.0.2.*` are documentation-only |
-| `hosts.yaml`: `ip`, `access_ip` | Node's actual private IP; keep them equal |
-| `ansible_user`, `ansible_ssh_private_key_file` | Provided SSH username/key; production sets these in `hosts.yaml` |
-| `kube_vip_*` | Keep disabled; do not add `loadbalancer_apiserver` for this design |
-| `group_vars/k8s_cluster.yaml`: API SAN list | All three actual public control-plane IPs |
-| `group_vars/k8s_cluster.yaml`: pod/service ranges | Confirm no network overlap |
-| `group_vars/all.yaml`: `firewall_admin_sources` | Exact authorized operator IPv4 addresses; include the current SSH source |
-| `group_vars/all.yaml`: `firewall_private_interface`, `firewall_public_interface` | Actual interfaces, currently eth1 and eth0 |
-| `install.yaml`: `clusterdos.clustername` | Already set to `aranya-takehome`; choose a unique name if needed |
-| `install.yaml`: `gitapps.config.targetRevision` | Full published commit SHA containing `charts/config` |
-| `argocd/nginx.yaml`: repo URL/revision | `https://github.com/johngarciasre/aranya.git` and full published commit SHA containing `manifests/nginx` |
+| `NODE1_PUBLIC_IP`, `NODE2_PUBLIC_IP`, `NODE3_PUBLIC_IP` | Public SSH addresses; also used as API certificate SANs and public HTTP endpoints |
+| `NODE1_PRIVATE_IP`, `NODE2_PRIVATE_IP`, `NODE3_PRIVATE_IP` | Private cluster addresses; also used as `access_ip` |
+| `ANSIBLE_USER`, `SSH_KEY` | SSH login and private key path |
+| `FIREWALL_ADMIN_SOURCES` | Comma-separated authorized operator IPv4 addresses; include the current connection source |
+| `FIREWALL_PRIVATE_INTERFACE`, `FIREWALL_PUBLIC_INTERFACE` | Actual private and public node interface names |
+
+The optional `KUBE_PODS_SUBNET` and `KUBE_SERVICE_ADDRESSES` inputs default to
+`10.233.64.0/18` and `10.233.0.0/18`. Verify neither overlaps node, VPN,
+corporate or other routed networks; set different CIDRs before rendering if they
+do. The renderer checks the supplied node addresses and CIDRs, not external routes.
+`install.yaml` sets `aranya-takehome`; choose a unique name only if needed, and
+update both `clusterdos.clustername` and `gitapps.config.values.clustername`.
 
 Do not confuse Kubespray `cluster_name` (which also influences the DNS domain) with
 the clusterdOS display name. Leave Kubespray DNS defaults unless intentionally
@@ -330,14 +375,19 @@ chmod 700 "$KUBECTL"
 ### Workstation API connectivity and manual switching
 
 Keep the generated config private and create an operator copy. All three public
-API addresses are in the certificate SAN list. After confirming source-restricted
-TCP 6443 access, select a node:
+API addresses are in the certificate SAN list. These initial steps are required
+for both direct and SSH-only access:
 
 ```bash
 cp "$KUBECONFIG" "$ROOT/.local/operator.kubeconfig"
 export KUBECONFIG="$ROOT/.local/operator.kubeconfig"
 export API_CLUSTER=$("$KUBECTL" config view --minify -o jsonpath='{.contexts[0].context.cluster}')
-export NODE_PUBLIC_IP=REPLACE_WITH_NODE1_PUBLIC_IP
+```
+
+For direct access, only after confirming source-restricted TCP 6443 access:
+
+```bash
+export NODE_PUBLIC_IP="$NODE1_PUBLIC_IP"
 "$KUBECTL" config set-cluster "$API_CLUSTER" --server="https://$NODE_PUBLIC_IP:6443"
 "$KUBECTL" get --raw='/readyz?verbose'
 ```
@@ -347,14 +397,20 @@ If that node is unavailable, set `NODE_PUBLIC_IP` to node2 or node3 and rerun
 use `insecure-skip-tls-verify` or assume kubeconfig tries alternate endpoints.
 
 For SSH-only access instead, keep public TCP 6443 closed and select a node-local
-tunnel. Replace the SSH username/key and node address from the private inventory:
+tunnel, using the values from `.local/production.env`:
 
 ```bash
 "$KUBECTL" config set-cluster "$API_CLUSTER" --server=https://127.0.0.1:16443
-ssh -i "$SSH_KEY" \
-  -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes \
-  -N -L 127.0.0.1:16443:127.0.0.1:6443 root@REPLACE_WITH_NODE1_PUBLIC_IP
+ssh -p 2026 -i "$SSH_KEY" \
+  -o StrictHostKeyChecking=yes -o HostKeyAlias="$NODE1_PUBLIC_IP" \
+  -o ExitOnForwardFailure=yes \
+  -N -L 127.0.0.1:16443:127.0.0.1:6443 "$ANSIBLE_USER@$NODE1_PUBLIC_IP"
 ```
+
+`HostKeyAlias` reuses the independently verified host key stored under the node's
+IP rather than prompting to trust a new `[IP]:2026` identity. Port 22 also works
+from an allowlisted source. No new keys or reviewer accounts are provisioned by
+opening 2026.
 
 Keep the tunnel running in a separate terminal; restart it through node2/node3 if
 needed. Certificates include `127.0.0.1`. Reviewers need their own authorized SSH
@@ -498,18 +554,20 @@ SSH/GPG keys, plaintext/encrypted kubeconfigs or credential attachments. The
 public `inventory/example` is intentionally non-secret. You may publish sanitized
 real inventory/network values only if authorized; never embed SSH passwords.
 
-The public repository is `https://github.com/johngarciasre/aranya`, with `takehome`
-as its default branch. The config chart and nginx sources are pinned to published
-commit `153915629b15f772ea88ada63556c148768d22d0`. The commands below illustrate
+The public repository is `https://github.com/johngarciasre/aranya`. The submission
+is published on `main` and tagged `v0.1.0`; `takehome` is retained. The config chart
+and nginx sources are pinned to published commit
+`153915629b15f772ea88ada63556c148768d22d0`. The commands below illustrate
 initial publication for a separate fresh checkout only; do not reinitialize this
-repository or commit to `main`. Review any subsequent publication separately.
+repository. Review and authorize subsequent publication separately.
 
 ```bash
 git init -b takehome
 git add .gitignore README.md RUNBOOK.md requirements.lock install.yaml deploy.yaml \
-  inventory/example charts/config argocd/nginx.yaml manifests/nginx/resources.yaml \
+  inventory/example inventory/production.env.example inventory/templates scripts/render_inventory.sh \
+  charts/config argocd/nginx.yaml manifests/nginx/resources.yaml \
   firewall.yaml templates tests/check.py tests/check_private_inventory.py \
-  tests/check_firewall.py tests/check_live_firewall.py tests/check_acceptance.py
+  tests/check_inventory_template.py tests/check_firewall.py tests/check_live_firewall.py tests/check_acceptance.py
 git diff --cached --check
 git diff --cached
 # Check the entire staged diff for keys, tokens and confidential data before committing.
@@ -554,9 +612,9 @@ adopt/manage it.
 "$KUBECTL" -n hello-aranya rollout status deployment/hello-aranya --timeout=300s
 "$KUBECTL" -n hello-aranya get pods -o wide
 "$KUBECTL" -n hello-aranya get service,endpointslices,pdb
-curl --fail --show-error --connect-timeout 10 http://REPLACE_WITH_NODE1_PUBLIC_IP:30080/
-curl --fail --show-error --connect-timeout 10 http://REPLACE_WITH_NODE2_PUBLIC_IP:30080/
-curl --fail --show-error --connect-timeout 10 http://REPLACE_WITH_NODE3_PUBLIC_IP:30080/
+for ip in "$NODE1_PUBLIC_IP" "$NODE2_PUBLIC_IP" "$NODE3_PUBLIC_IP"; do
+  curl --fail --show-error --connect-timeout 10 "http://$ip:30080/"
+done
 ```
 
 Run curl from outside the provider's private network. Require HTTP 200 and

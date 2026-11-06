@@ -1,0 +1,37 @@
+all:
+  hosts:
+    node1:
+      ansible_host: "${NODE1_PUBLIC_IP}"
+      ip: "${NODE1_PRIVATE_IP}"
+      access_ip: "${NODE1_PRIVATE_IP}"
+      etcd_member_name: etcd1
+    node2:
+      ansible_host: "${NODE2_PUBLIC_IP}"
+      ip: "${NODE2_PRIVATE_IP}"
+      access_ip: "${NODE2_PRIVATE_IP}"
+      etcd_member_name: etcd2
+    node3:
+      ansible_host: "${NODE3_PUBLIC_IP}"
+      ip: "${NODE3_PRIVATE_IP}"
+      access_ip: "${NODE3_PRIVATE_IP}"
+      etcd_member_name: etcd3
+  children:
+    kube_control_plane:
+      hosts:
+        node1: {}
+        node2: {}
+        node3: {}
+    etcd:
+      hosts:
+        node1: {}
+        node2: {}
+        node3: {}
+    kube_node:
+      hosts:
+        node1: {}
+        node2: {}
+        node3: {}
+    k8s_cluster:
+      children:
+        kube_control_plane: {}
+        kube_node: {}

@@ -84,6 +84,9 @@ if args.nginx:
             assert response.status == 200 and 'hello aranya' in response.read().decode()
     print('PASS: three spread nginx pods, config/nginx GitOps and public HTTP 200 on all nodes')
 for name, host in hosts.items():
+    with socket.create_connection((host['ansible_host'], 2026), timeout=5) as connection:
+        assert connection.recv(255).startswith(b'SSH-2.0-'), name
+    print(f'PASS: {name} public SSH 2026 reachable')
     for port in (2379, 2380, 6443, 10250):
         try:
             with socket.create_connection((host['ansible_host'], port), timeout=2):

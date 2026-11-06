@@ -1,0 +1,15 @@
+ansible_user: "${ANSIBLE_USER}"
+ansible_ssh_private_key_file: ${SSH_KEY_YAML}
+ansible_become: true
+ansible_python_interpreter: /usr/bin/python3
+kubeconfig_localhost: true
+kubeconfig_localhost_ansible_host: true
+kubectl_localhost: true
+kube_vip_enabled: false
+kube_vip_controlplane_enabled: false
+kube_vip_arp_enabled: false
+kube_vip_bgp_enabled: false
+kube_vip_services_enabled: false
+firewall_admin_sources: ${FIREWALL_ADMIN_SOURCES_YAML}
+firewall_private_interface: "${FIREWALL_PRIVATE_INTERFACE}"
+firewall_public_interface: "${FIREWALL_PUBLIC_INTERFACE}"

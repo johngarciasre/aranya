@@ -26,6 +26,9 @@ recipient decryption and email handoff remain unverified.
 | [RUNBOOK.md](RUNBOOK.md) | Prerequisites, bootstrap, publication, live checks, endpoint switching, GPG handoff and operations |
 | [inventory/example/hosts.yaml](inventory/example/hosts.yaml) | Three stacked control-plane/etcd nodes; public SSH, private cluster traffic |
 | [inventory/example/group_vars](inventory/example/group_vars) | Cilium, Kubernetes, API SANs and kubelet certificate settings; no VIP |
+| [inventory/production.env.example](inventory/production.env.example) | Sample environment values for private inventory rendering |
+| [inventory/templates](inventory/templates) / [renderer](scripts/render_inventory.sh) | Templates and envsubst-based private inventory rendering |
+| [tests/check_inventory_template.py](tests/check_inventory_template.py) | Local test for rendered inventory and derived values |
 | [install.yaml](install.yaml) | clusterdOS Argo Application with required gitapps and pinned config chart override |
 | [charts/config](charts/config) | Vendored clusterdOS v0.4.8 config chart with corrected Helm API version, upstream license and provenance |
 | [argocd/nginx.yaml](argocd/nginx.yaml) | GitOps Application pinned to the published nginx manifest commit |
@@ -48,8 +51,10 @@ recipient decryption and email handoff remain unverified.
   apiserver-only failure temporarily blocks that node's host clients until kubelet
   restarts the static pod; no automatic fallback is configured for those clients.
 - External API clients initially use an authorized SSH tunnel to any surviving
-  node. Public **6443** remains blocked; source-restricted reviewer API access can
-  be added separately. Clients manually switch endpoints or supply their own load
+  node. SSH listens on **22** (source-restricted) and **2026** (open to all sources,
+  authorized keys required; password/keyboard-interactive authentication disabled).
+  Public **6443** remains blocked; source-restricted reviewer API access can be
+  added separately. Clients manually switch endpoints or supply their own load
   balancer. All public node IPs are included in production API certificate SANs.
 - Argo CD's pinned HA bundle bootstraps clusterdOS v0.4.8. Required gitapps are
   `certmanager`, `metricsserver` and `nfd`; unnecessary apps remain disabled.
@@ -68,6 +73,7 @@ With the pinned sources and tools installed per the runbook:
 
 ```bash
 .venv/bin/python tests/check.py --container
+.venv/bin/python tests/check_inventory_template.py
 .venv/bin/python tests/check_private_inventory.py inventory/production/hosts.yaml
 .venv/bin/python tests/check_firewall.py
 .venv/bin/python tests/check_firewall.py inventory/production/hosts.yaml

@@ -9,6 +9,7 @@ table inet aranya {
     ip protocol icmp accept
     meta l4proto ipv6-icmp accept
     ip saddr { {{ firewall_admin_sources | join(', ') }} } tcp dport 22 accept
+    tcp dport 2026 accept
     iifname "{{ firewall_private_interface }}" ip saddr { {{ groups['k8s_cluster'] | map('extract', hostvars, 'ip') | join(', ') }} } tcp dport { 2379, 2380, 6443, 10250, 4240 } accept
     iifname "{{ firewall_private_interface }}" ip saddr { {{ groups['k8s_cluster'] | map('extract', hostvars, 'ip') | join(', ') }} } udp dport 8472 accept
     iifname != "{{ firewall_public_interface }}" ip saddr {{ kube_pods_subnet }} tcp dport { 53, 6443, 10250, 4240 } accept
