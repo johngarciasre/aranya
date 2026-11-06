@@ -156,6 +156,61 @@ source-restricted access and private cluster paths. Provider connectivity for
 DNS, NTP and upstream downloads is checked during preflight; the host table
 leaves outbound traffic allowed rather than adding destination allowlists.
 
+### Operator access via SSH 2026
+
+On an already provisioned cluster, an operator whose public IPv4 is not yet
+allowlisted for port 22 can connect with Ansible on **2026**, provided their SSH
+key is already authorized. This does not grant reviewer access or install keys.
+Use the production inventory, trusted host keys and workstation setup from the
+[runbook](RUNBOOK.md#2-set-up-the-workstation). Keep any verified
+`UserKnownHostsFile` setting in `ANSIBLE_SSH_COMMON_ARGS`.
+
+1. Verify authenticated access through port 2026 on all three nodes:
+
+   ```bash
+   export INVENTORY="$ROOT/inventory/production/hosts.yaml"
+   export ANSIBLE_HOST_KEY_CHECKING=True
+   export ANSIBLE_SSH_ARGS='-o ControlMaster=auto -o ControlPersist=60s -o StrictHostKeyChecking=yes'
+   "$ROOT/.venv/bin/ansible" -i "$INVENTORY" all -m ansible.builtin.ping \
+     -e '{"ansible_port":2026,"ansible_ssh_extra_args":"-o HostKeyAlias={{ ansible_host }}"}'
+   ```
+
+   `HostKeyAlias` reuses the independently verified key stored under each node's
+   IP. Do not disable host-key checking to work around a failed connection.
+2. After authorization, add the operator's public **egress IPv4** (including any
+   VPN/NAT) to `firewall_admin_sources` in
+   `inventory/production/group_vars/all.yaml`. Preserve every existing address,
+   including the source of the current Ansible connection. For example, append
+   `203.0.113.20` as another YAML list entry; substitute the actual public IPv4,
+   not a private workstation address. Also add it to the comma-separated
+   `FIREWALL_ADMIN_SOURCES` in your trusted `.local/production.env`, if used, so
+   future inventory rendering retains it. Do not overwrite existing inventory.
+3. Apply the persistent host rules through the firewall playbook, still using
+   port 2026. **This changes firewall rules and may refresh SSH listeners on all
+   three nodes**; use the existing serial rollout and rollback protection:
+
+   ```bash
+   "$ROOT/.venv/bin/ansible-playbook" -i "$INVENTORY" "$ROOT/firewall.yaml" \
+     -e '{"ansible_port":2026,"ansible_ssh_extra_args":"-o HostKeyAlias={{ ansible_host }}"}'
+   ```
+
+   Add `--ask-become-pass` in an interactive terminal if sudo requires it. Require
+   a successful recap for all three nodes, then verify port 22 from the newly
+   allowlisted source with a fresh connection:
+
+   ```bash
+   "$ROOT/.venv/bin/ansible" -i "$INVENTORY" all -m ansible.builtin.ping \
+     -e '{"ansible_port":22,"ansible_ssh_args":"-o ControlMaster=no -o StrictHostKeyChecking=yes"}'
+   ```
+
+The allowlist affects **SSH 22 only**; SSH 2026 remains public and key-only, and
+public API port 6443 remains blocked. This repository manages nftables, not a
+separate iptables host allowlist. Do not insert ad hoc `nft`/`iptables` rules or
+flush either ruleset: the playbook persists the owned `inet aranya` table, while
+Kubernetes/Cilium retain their own networking rules. For reviewer kubeconfig
+access, pair separately authorized SSH credentials with the
+[node-local API tunnel](RUNBOOK.md#workstation-api-connectivity-and-manual-switching).
+
 ## Versions
 
 | Component | Pin |
