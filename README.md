@@ -6,14 +6,16 @@ build, validation, handoff and operating instructions.
 
 ## Status
 
-**The cluster, required addons and nginx are deployed; reviewer access and
-handoff remain outstanding.** On 2026-11-06 UTC all three Kubernetes v1.36.4 nodes
+**The cluster, required addons, nginx and reviewer access preparation are complete;
+the email handoff remains.** On 2026-11-06 UTC all three Kubernetes v1.36.4 nodes
 were Ready, Cilium was 3/3 and its operator 2/2. Argo CD v3.6.1 workloads were
 Ready: Redis 3/3, server and repo-server 2/2 each, and controller 1/1. All six
 Applications, including clusterdOS and nginx, were Synced/Healthy. The metrics
 APIService was Available with TLS verification and `kubectl top` worked; NFD
 reported Intel CPU vendor labels on all three nodes. Nginx had three Ready pods,
 one per node; public HTTP returned `hello aranya` on all three node addresses.
+Reviewer SSH access is arranged. The admin kubeconfig was tested through the SSH
+tunnel and encrypted to the three authenticated reviewer keys.
 
 The vendored config chart and explicit cluster name restored reconciliation.
 Persistent nftables host protection and the revised rollback playbook were applied
@@ -27,9 +29,9 @@ existing inventory.
 Disruptive failover testing was deliberately skipped because provider console
 access was unavailable; one-node fault tolerance is designed, not demonstrated.
 The rollback script was syntax-checked but not tested by inducing an SSH lockout.
-Reviewer access, GPG encryption, recipient decryption and email handoff remain
-unverified. A clean checkout rebuild on fresh nodes has not been demonstrated.
-This is not yet a completed take-home submission.
+Reviewer SSH access and GPG-encrypted kubeconfig handoff are treated as solved.
+The original-thread email remains to be sent. A clean checkout rebuild on fresh
+nodes has not been demonstrated, so reproduction is documented but not proven.
 
 ## Scope
 
@@ -288,13 +290,13 @@ Read-only live acceptance checks node readiness, private InternalIPs, Cilium,
 Argo and required addon health, metrics TLS/API, NFD, public SSH 2026 and filtering
 of etcd/API/kubelet ports. `--nginx` additionally checks config/nginx Application
 health, three spread nginx pods and public HTTP on all three nodes. These checks
-do not prove failover or recipient decryption. See [status](#status) for results.
+do not prove failover or reviewer-side decryption. See [status](#status) for results.
 
 ## Publication
 
 The public repository is [johngarciasre/aranya](https://github.com/johngarciasre/aranya).
-The submission is published on `main` and tagged `v0.1.0`; `takehome` is retained.
-The release commit is `08e059b80e3e7ddf61dc9daa278902e4455d03d5`.
+The submission is published on `main` and `takehome` and tagged `v0.1.1`.
+Resolve the release commit with `git rev-parse 'v0.1.1^{commit}'`.
 
 The config chart and nginx manifest source commit is
 `153915629b15f772ea88ada63556c148768d22d0`. Both Applications pin content SHAs,
@@ -303,12 +305,10 @@ than itself; later content changes need a new content commit and pointer update.
 
 ## Remaining handoff
 
-Reviewer access must be agreed and provisioned. All three GPG fingerprints still
-need independent authentication, followed by encryption of a tested admin
-kubeconfig to all three recipients and each reviewer's access/decryption check.
-The final runbook and encrypted kubeconfig must be attached in the original email
-thread, with connectivity instructions and a public nginx URL.
-
-Email sending and reviewer access changes require explicit approval. Follow the
+Reviewer SSH access and GPG encryption are treated as solved. Send the final
+runbook and encrypted admin kubeconfig in the original email thread, along with
+the public repository link, nginx URL and SSH tunnel instructions. Do not attach
+either plaintext kubeconfig. Reviewer decryption and live access confirmation
+remain to be collected. Follow the
 [handoff procedure](RUNBOOK.md#10-encrypt-admin-kubeconfig-for-all-three-reviewers)
 and [email checklist](RUNBOOK.md#11-final-email-checklist).
